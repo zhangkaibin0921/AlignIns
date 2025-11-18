@@ -657,6 +657,7 @@ class Aggregation():
         else:
             sum_dis_full = np.sum(combined_D, axis=1)
             seed_local = int(allowed_indices[int(np.argmin(sum_dis_full[allowed_indices]))])
+        logging.info(f"[ScopeMM] Seed local index: {seed_local}, client ID: {client_ids[seed_local]}")
         cluster = set([seed_local])
         visited = set([seed_local])
         front = set([seed_local])
@@ -777,6 +778,8 @@ class Aggregation():
                 sum_dis[j] += cosine_distance
 
         choice = int(np.argmin(sum_dis))
+        seed_idx = choice
+        logging.info(f"[Scope] Seed local index: {seed_idx}, client ID: {client_ids[seed_idx]}")
         cluster = [choice]
         for _ in range(n):
             tmp = int(np.argmin(cos_dis[choice]))
