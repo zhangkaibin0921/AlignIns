@@ -21,6 +21,10 @@ class Aggregation():
             self.memory_dict = dict()
             self.wv_history = []
         
+        if self.args.aggr == 'scopemm':
+            self.tpr_history = []
+            self.fpr_history = []
+        
          
     def aggregate_updates(self, global_model, agent_updates_dict):
 
@@ -41,6 +45,10 @@ class Aggregation():
             aggregated_updates = self.agg_alignins(agent_updates_dict, cur_global_params)
         elif self.args.aggr == 'mmetric':
             aggregated_updates = self.agg_mul_metric(agent_updates_dict, global_model, cur_global_params)
+        elif self.args.aggr == 'scopemm':
+            aggregated_updates = self.agg_scope_multimetric(agent_updates_dict, global_model, cur_global_params)
+        elif self.args.aggr == 'scope':
+            aggregated_updates = self.agg_scope(agent_updates_dict, global_model, cur_global_params)
         elif self.args.aggr == 'foolsgold':
             aggregated_updates = self.agg_foolsgold(agent_updates_dict)
         elif self.args.aggr == 'signguard':
@@ -83,8 +91,8 @@ class Aggregation():
 
     def agg_alignins(self, agent_updates_dict, flat_global_model):
         local_updates = []
-        benign_id = []
-        malicious_id = []
+        benign_id = []  # 实际干净的客户端ID（真实标签）
+        malicious_id = []  # 实际恶意的客户端ID（真实标签）
 
         for _id, update in agent_updates_dict.items():
             local_updates.append(update)
@@ -93,8 +101,8 @@ class Aggregation():
             else:
                 benign_id.append(_id)
 
-        chosen_clients = malicious_id + benign_id
-        num_chosen_clients = len(malicious_id + benign_id)
+        chosen_clients = malicious_id + benign_id  # 所有客户端ID列表（恶意+干净）
+        num_chosen_clients = len(chosen_clients)
         inter_model_updates = torch.stack(local_updates, dim=0)
 
         tda_list = []
@@ -102,44 +110,82 @@ class Aggregation():
         major_sign = torch.sign(torch.sum(torch.sign(inter_model_updates), dim=0))
         cos = torch.nn.CosineSimilarity(dim=0, eps=1e-6)
         for i in range(len(inter_model_updates)):
-            _, init_indices = torch.topk(torch.abs(inter_model_updates[i]), int(len(inter_model_updates[i]) * self.args.sparsity))
-
-            mpsa_list.append((torch.sum(torch.sign(inter_model_updates[i][init_indices]) == major_sign[init_indices]) / torch.numel(inter_model_updates[i][init_indices])).item())
-    
-            tda_list.append(cos(inter_model_updates[i], flat_global_model).item())
-
+            _, init_indices = torch.topk(torch.abs(inter_model_updates[i]),
+                                         int(len(inter_model_updates[i]) * self.args.sparsity))
+            # 计算MPSA
+            mpsa = (torch.sum(
+                torch.sign(inter_model_updates[i][init_indices]) == major_sign[init_indices]) / torch.numel(
+                inter_model_updates[i][init_indices])).item()
+            mpsa_list.append(mpsa)
+            # 计算TDA
+            tda = cos(inter_model_updates[i], flat_global_model).item()
+            tda_list.append(tda)
 
         logging.info('TDA: %s' % [round(i, 4) for i in tda_list])
         logging.info('MPSA: %s' % [round(i, 4) for i in mpsa_list])
 
-
         ######## MZ-score calculation ########
-        mpsa_std = np.std(mpsa_list)
+        # MPSA的MZ-score
+        mpsa_std = np.std(mpsa_list) if len(mpsa_list) > 1 else 1e-12
         mpsa_med = np.median(mpsa_list)
-
-        mzscore_mpsa = []
-        for i in range(len(mpsa_list)):
-            mzscore_mpsa.append(np.abs(mpsa_list[i] - mpsa_med) / mpsa_std)
-
+        mzscore_mpsa = [np.abs(m - mpsa_med) / mpsa_std for m in mpsa_list]
         logging.info('MZ-score of MPSA: %s' % [round(i, 4) for i in mzscore_mpsa])
-        
-        tda_std = np.std(tda_list)
-        tda_med = np.median(tda_list)
-        mzscore_tda = []
-        for i in range(len(tda_list)):
-            mzscore_tda.append(np.abs(tda_list[i] - tda_med) / tda_std)
 
+        # TDA的MZ-score
+        tda_std = np.std(tda_list) if len(tda_list) > 1 else 1e-12
+        tda_med = np.median(tda_list)
+        mzscore_tda = [np.abs(t - tda_med) / tda_std for t in tda_list]
         logging.info('MZ-score of TDA: %s' % [round(i, 4) for i in mzscore_tda])
 
         ######## Anomaly detection with MZ score ########
+        # MPSA筛选出的良性索引（chosen_clients的索引）
+        benign_idx1 = set(range(num_chosen_clients))
+        benign_idx1.intersection_update(
+            set(np.argwhere(np.array(mzscore_mpsa) < self.args.lambda_s).flatten().astype(int)))
 
-        benign_idx1 = set([i for i in range(num_chosen_clients)])
-        benign_idx1 = benign_idx1.intersection(set([int(i) for i in np.argwhere(np.array(mzscore_mpsa) < self.args.lambda_s)]))
-        benign_idx2 = set([i for i in range(num_chosen_clients)])
-        benign_idx2 = benign_idx2.intersection(set([int(i) for i in np.argwhere(np.array(mzscore_tda) < self.args.lambda_c)]))
+        # TDA筛选出的良性索引（chosen_clients的索引）
+        benign_idx2 = set(range(num_chosen_clients))
+        benign_idx2.intersection_update(
+            set(np.argwhere(np.array(mzscore_tda) < self.args.lambda_c).flatten().astype(int)))
 
+        ######## 计算MPSA和TDA的Precision并打印 ########
+        def _calc_precision(selected_indices, chosen_ids, actual_benign_ids):
+            """
+            计算Precision：真正干净数 / 选中数
+            selected_indices：筛选出的索引（对应chosen_ids的索引）
+            chosen_ids：所有客户端ID列表（malicious_id + benign_id）
+            actual_benign_ids：实际干净的客户端ID列表（真实标签）
+            """
+            selected_count = len(selected_indices)
+            if selected_count == 0:
+                return None, selected_count, 0
+            # 统计选中的客户端中实际干净的数量
+            true_clean_count = 0
+            for idx in selected_indices:
+                actual_id = chosen_ids[idx]  # 索引对应的实际客户端ID
+                if actual_id in actual_benign_ids:
+                    true_clean_count += 1
+            precision = true_clean_count / selected_count
+            return precision, selected_count, true_clean_count
+
+        # MPSA的Precision
+        mpsa_precision, mpsa_selected, mpsa_true_clean = _calc_precision(benign_idx1, chosen_clients, benign_id)
+        if mpsa_precision is not None:
+            logging.info(
+                f"[MPSA] 识别的干净客户端准确率(Precision): {mpsa_precision:.4f}  |  选中数: {mpsa_selected}  真正干净数: {mpsa_true_clean}")
+        else:
+            logging.info(f"[MPSA] 无选中客户端，无法计算干净客户端准确率")
+
+        # TDA的Precision
+        tda_precision, tda_selected, tda_true_clean = _calc_precision(benign_idx2, chosen_clients, benign_id)
+        if tda_precision is not None:
+            logging.info(
+                f"[TDA] 识别的干净客户端准确率(Precision): {tda_precision:.4f}  |  选中数: {tda_selected}  真正干净数: {tda_true_clean}")
+        else:
+            logging.info(f"[TDA] 无选中客户端，无法计算干净客户端准确率")
+
+        ######## 后续原有逻辑 ########
         benign_set = benign_idx2.intersection(benign_idx1)
-        
         benign_idx = list(benign_set)
         if len(benign_idx) == 0:
             return torch.zeros_like(local_updates[0])
@@ -147,42 +193,34 @@ class Aggregation():
         benign_updates = torch.stack([local_updates[i] for i in benign_idx], dim=0)
 
         ######## Post-filtering model clipping ########
-        
         updates_norm = torch.norm(benign_updates, dim=1).reshape((-1, 1))
         norm_clip = updates_norm.median(dim=0)[0].item()
         benign_updates = torch.stack(local_updates, dim=0)
         updates_norm = torch.norm(benign_updates, dim=1).reshape((-1, 1))
         updates_norm_clipped = torch.clamp(updates_norm, 0, norm_clip, out=None)
-        # del grad_norm
-        
-        benign_updates = (benign_updates/updates_norm)*updates_norm_clipped
+        benign_updates = (benign_updates / updates_norm) * updates_norm_clipped
 
+        ######## 原有TPR/FPR计算 ########
         correct = 0
         for idx in benign_idx:
-            if idx >= len(malicious_id):
+            if chosen_clients[idx] in benign_id:  # 修正：用实际ID判断是否干净
                 correct += 1
+        TPR = correct / len(benign_id) if len(benign_id) > 0 else 0.0
 
-        TPR = correct / len(benign_id)
-
-        if len(malicious_id) == 0:
-            FPR = 0
-        else:
+        FPR = 0.0
+        if len(malicious_id) > 0:
             wrong = 0
             for idx in benign_idx:
-                if idx < len(malicious_id):
+                if chosen_clients[idx] in malicious_id:  # 修正：用实际ID判断是否恶意
                     wrong += 1
             FPR = wrong / len(malicious_id)
 
         logging.info('benign update index:   %s' % str(benign_id))
         logging.info('selected update index: %s' % str(benign_idx))
-
-        logging.info('FPR:       %.4f'  % FPR)
+        logging.info('FPR:       %.4f' % FPR)
         logging.info('TPR:       %.4f' % TPR)
 
-        current_dict = {}
-        for idx in benign_idx:
-            current_dict[chosen_clients[idx]] = benign_updates[idx]
-
+        current_dict = {chosen_clients[idx]: benign_updates[idx] for idx in benign_idx}
         aggregated_update = self.agg_avg(current_dict)
         return aggregated_update
 
@@ -403,3 +441,414 @@ class Aggregation():
         print(aggregated_model.shape)
 
         return aggregated_model
+
+    def agg_scope_multimetric(self, agent_updates_dict, global_model, flat_global_model):
+        """
+        Scope-style multi-metric defense adapted to aggregation setting.
+        - Build per-client model vectors as (flat_global_model + update)
+        - Compute relative change pre-metric
+        - Multi-metric pairwise distances (cosine, L1, L2), z-score standardize and combine
+        - MPSA-based prefilter on updates
+        - Wave expansion from a seed in allowed set to select clients
+        - Weighted average of selected updates by agent_data_sizes
+        """
+        eps = getattr(self.args, "eps", 1e-12)
+        sparsity = getattr(self.args, "sparsity", 0.3)
+        lambda_s = getattr(self.args, "lambda_s", 1.0)
+        percent_select = float(getattr(self.args, "percent_select", 20.0))
+        combine_method = getattr(self.args, "combine_method", "max")
+        use_candidate_seed = getattr(self.args, "use_candidate_seed", False)
+        use_mpsa_prefilter = getattr(self.args, "use_mpsa_prefilter", False)
+        self.candidate_seed_ratio = float(getattr(self.args, "candidate_seed_ratio", 0.25))
+        # FedID dynamic weighting regularization coefficient
+        self.fedid_reg = float(getattr(self.args, "fedid_reg", 1e-3))
+
+        # Maintain client id order for weighting and build label lists
+        client_ids = []
+        local_updates = []
+        benign_id = []
+        malicious_id = []
+        for _id, update in agent_updates_dict.items():
+            client_ids.append(_id)
+            local_updates.append(update)
+            if _id < self.args.num_corrupt:
+                malicious_id.append(_id)
+            else:
+                benign_id.append(_id)
+
+        # Build client model vectors (numpy)
+        vectorize_global = flat_global_model.detach().cpu().numpy()
+        client_model_vecs = []
+        for upd in local_updates:
+            client_model_vecs.append((flat_global_model + upd).detach().cpu().numpy())
+
+        # Step: relative change pre-metric
+        pre_metric_dis = []
+        for g_i in client_model_vecs:
+            pre_metric = np.power(np.abs(g_i - vectorize_global) / (np.abs(g_i) + np.abs(vectorize_global) + eps), 2.0) * np.sign(g_i - vectorize_global)
+            pre_metric_dis.append(pre_metric)
+
+        n = len(pre_metric_dis)
+        if n == 0:
+            return torch.zeros_like(flat_global_model)
+        if n == 1:
+            return local_updates[0]
+
+        # Multi-metric pairwise distances
+        cos_mat = np.zeros((n, n), dtype=np.float64)
+        l1_mat = np.zeros((n, n), dtype=np.float64)
+        l2_mat = np.zeros((n, n), dtype=np.float64)
+        for i in range(n):
+            gi = pre_metric_dis[i]
+            ni = np.linalg.norm(gi) + eps
+            for j in range(i + 1, n):
+                gj = pre_metric_dis[j]
+                nj = np.linalg.norm(gj) + eps
+                cosine_distance = float(1.0 - (np.dot(gi, gj) / (ni * nj)))
+                manhattan_distance = float(np.linalg.norm(gi - gj, ord=1))
+                euclidean_distance = float(np.linalg.norm(gi - gj))
+                cos_mat[i, j] = cos_mat[j, i] = cosine_distance
+                l1_mat[i, j] = l1_mat[j, i] = manhattan_distance
+                l2_mat[i, j] = l2_mat[j, i] = euclidean_distance
+
+        # z-score each metric using upper triangle stats
+        std_mats = []
+        for M in (cos_mat, l1_mat, l2_mat):
+            triu = M[np.triu_indices_from(M, k=1)]
+            mean = np.mean(triu) if triu.size > 0 else 0.0
+            std = np.std(triu) if triu.size > 0 else 1.0
+            std = std if std > eps else 1.0
+            Z = (M - mean) / std
+            std_mats.append(Z)
+        cosZ, l1Z, l2Z = std_mats
+
+        # Combine
+        combined_D = np.zeros((n, n), dtype=np.float64)
+        if combine_method == "euclidean":
+            combined_D = np.sqrt(np.maximum(cosZ, 0.0) ** 2 + np.maximum(l1Z, 0.0) ** 2 + np.maximum(l2Z, 0.0) ** 2)
+        elif combine_method == "max":
+            combined_D = np.maximum.reduce([cosZ, l1Z, l2Z])
+        elif combine_method == "mahalanobis":
+            idx_i, idx_j = np.triu_indices(n, k=1)
+            feats = np.stack([cosZ[idx_i, idx_j], l1Z[idx_i, idx_j], l2Z[idx_i, idx_j]], axis=1)
+            cov = np.cov(feats.T)
+            try:
+                inv = np.linalg.inv(cov)
+            except np.linalg.LinAlgError:
+                inv = np.eye(3)
+            for i in range(n):
+                for j in range(i + 1, n):
+                    v = np.array([cosZ[i, j], l1Z[i, j], l2Z[i, j]])
+                    d = float(v.T @ inv @ v)
+                    combined_D[i, j] = combined_D[j, i] = d
+        elif combine_method == "fedid_dynamic":  # 新增：FedID动态加权策略
+            # 步骤1：构建每个客户端的三维距离特征向量（对所有其他客户端的距离取平均）
+            client_features = np.zeros((n, 3), dtype=np.float64)  # [n, 3]：n个客户端，3种度量
+            for i in range(n):
+                mask = np.arange(n) != i  # 排除自身距离（对角线）
+                # client_features[i, 0] = np.mean(cosZ[i, mask])  # 余弦距离均值
+                # client_features[i, 1] = np.mean(l1Z[i, mask])  # L1距离均值
+                # client_features[i, 2] = np.mean(l2Z[i, mask])  # L2距离均值
+                client_features[i, 0] = np.sum(cosZ[i, mask])  # 余弦距离总和
+                client_features[i, 1] = np.sum(l1Z[i, mask])  # L1距离总和
+                client_features[i, 2] = np.sum(l2Z[i, mask])  # L2距离总和
+
+            # 步骤2：计算浓度矩阵（协方差矩阵的逆，加入正则化）
+            cov_matrix = np.cov(client_features.T)  # 3x3协方差矩阵（反映度量间相关性）
+            reg_cov = cov_matrix + self.fedid_reg * np.eye(3)  # 正则化，避免奇异
+            try:
+                concentration_matrix = np.linalg.inv(reg_cov)  # 浓度矩阵（动态权重核心）
+                logging.info(f"[FedID动态加权] 浓度矩阵计算完成，正则化系数={self.fedid_reg}")
+            except np.linalg.LinAlgError:
+                # 极端情况：协方差矩阵无法求逆，退化为单位矩阵（等权重）
+                concentration_matrix = np.eye(3)
+                logging.warning("[FedID动态加权] 协方差矩阵奇异，退化为单位矩阵加权")
+
+            # 步骤3：用浓度矩阵对距离向量进行白化处理（动态加权融合）
+            for i in range(n):
+                for j in range(i + 1, n):
+                    # 客户端i和j的三维距离向量（标准化后）
+                    dist_vec = np.array([cosZ[i, j], l1Z[i, j], l2Z[i, j]])
+                    # 白化处理：通过浓度矩阵自适应加权（二次型计算）
+                    dynamic_dist = dist_vec.T @ concentration_matrix @ dist_vec
+                    # 确保距离非负（理论上应为非负，实际加安全保障）
+                    combined_D[i, j] = combined_D[j, i] = max(dynamic_dist, 0.0)
+        else:
+            combined_D = np.sqrt(np.maximum(cosZ, 0.0) ** 2 + np.maximum(l1Z, 0.0) ** 2 + np.maximum(l2Z, 0.0) ** 2)
+        np.fill_diagonal(combined_D, 0.0)
+
+        # MPSA prefilter on updates (torch)
+        if use_mpsa_prefilter:
+            inter_model_updates = torch.stack(local_updates, dim=0)  # updates w.r.t global
+            major_sign = torch.sign(torch.sum(torch.sign(inter_model_updates), dim=0))
+            topk_dim = max(1, int(inter_model_updates.shape[1] * float(sparsity)))
+            mpsa_list = []
+            for i in range(inter_model_updates.shape[0]):
+                vec_i = inter_model_updates[i]
+                abs_i = torch.abs(vec_i)
+                _, init_indices = torch.topk(abs_i, topk_dim)
+                agree = torch.sum(torch.sign(vec_i[init_indices]) == major_sign[init_indices]).item()
+                mpsa = agree / float(init_indices.numel())
+                mpsa_list.append(mpsa)
+            # MZ-score on MPSA
+            mpsa_arr = np.array(mpsa_list, dtype=np.float64)
+            mpsa_std = np.std(mpsa_arr)
+            mpsa_med = np.median(mpsa_arr)
+            mpsa_std = mpsa_std if mpsa_std > eps else 1.0
+            mzscore_mpsa = np.abs(mpsa_arr - mpsa_med) / mpsa_std
+            allowed_indices = [int(i) for i in np.where(mzscore_mpsa < float(lambda_s))[0]]
+            if len(allowed_indices) == 0:
+                logging.info("[ScopeMM] MPSA未筛出良性客户端，退化为使用全部客户端")
+                allowed_indices = list(range(n))
+            allowed_indices = sorted(allowed_indices)
+        else:
+            # No MPSA prefilter: use all clients as allowed set
+            allowed_indices = list(range(n))
+            logging.info("[ScopeMM] 已关闭MPSA预筛选，使用全部客户端作为允许集合")
+
+        # MPSA precision logging (chosen = allowed_indices)
+        def _calc_precision(selected_indices, id_list, actual_benign_ids):
+            selected_count = len(selected_indices)
+            if selected_count == 0:
+                return None, selected_count, 0
+            true_clean_count = 0
+            for idx in selected_indices:
+                actual_id = id_list[idx]
+                if actual_id in actual_benign_ids:
+                    true_clean_count += 1
+            precision = true_clean_count / selected_count
+            return precision, selected_count, true_clean_count
+        mpsa_precision, mpsa_selected, mpsa_true_clean = _calc_precision(allowed_indices, client_ids, benign_id)
+        if mpsa_precision is not None:
+            logging.info(f"[MPSA] 识别的干净客户端准确率(Precision): {mpsa_precision:.4f}  |  选中数: {mpsa_selected}  真正干净数: {mpsa_true_clean}")
+        else:
+            logging.info(f"[MPSA] 无选中客户端，无法计算干净客户端准确率")
+
+        # Wave expansion on allowed set
+        if use_candidate_seed:
+            allowed_arr = np.array(allowed_indices, dtype=int)
+            if len(allowed_arr) == 0:
+                logging.info("[ScopeMultiMetricDefense] 候选种子阶段允许集合为空，退化为使用全部客户端")
+                allowed_indices = list(range(n))
+                allowed_arr = np.array(allowed_indices, dtype=int)
+            sum_dis_allowed = np.zeros(len(allowed_indices))
+            for idx, local_i in enumerate(allowed_indices):
+                mask = allowed_arr != local_i
+                sum_dis_allowed[idx] = np.sum(combined_D[local_i, allowed_arr[mask]])
+            num_candidates = max(1, int(len(allowed_indices) * self.candidate_seed_ratio))
+            sorted_candidate_indices = np.argsort(sum_dis_allowed)[:num_candidates]
+            candidate_seeds = [allowed_indices[i] for i in sorted_candidate_indices]
+            logging.info(
+                f"[种子选择] 候选种子比例：{self.candidate_seed_ratio}，候选种子：{candidate_seeds}，共{len(candidate_seeds)}个")
+            if len(candidate_seeds) == 1:
+                seed_local = candidate_seeds[0]
+            else:
+                candidate_dist_sum = []
+                for seed in candidate_seeds:
+                    other_candidates = [s for s in candidate_seeds if s != seed]
+                    if len(other_candidates) == 0:
+                        dist_sum = 0.0
+                    else:
+                        dist_sum = np.sum(combined_D[seed, other_candidates])
+                    candidate_dist_sum.append(dist_sum)
+                best_candidate_idx = int(np.argmin(candidate_dist_sum))
+                seed_local = candidate_seeds[best_candidate_idx]
+                logging.info(f"[种子校验] 候选种子距离和：{candidate_dist_sum}，最终选择种子：{seed_local}")
+        else:
+            sum_dis_full = np.sum(combined_D, axis=1)
+            seed_local = int(allowed_indices[int(np.argmin(sum_dis_full[allowed_indices]))])
+        cluster = set([seed_local])
+        visited = set([seed_local])
+        front = set([seed_local])
+        cur_percent = float(percent_select)
+        allowed_arr = np.array(allowed_indices, dtype=int)
+        round_idx = 1
+        while cur_percent > 0 and len(front) > 0:
+            k = max(1, int(round(len(allowed_indices) * (cur_percent / 100.0))))
+            next_front = set()
+            for u in front:
+                dists = combined_D[u, allowed_arr]
+                neigh_pos = np.argsort(dists)[:k]
+                neighbors = allowed_arr[neigh_pos]
+                for v in neighbors:
+                    if int(v) not in visited:
+                        next_front.add(int(v))
+            if len(next_front) == 0:
+                break
+            # Branch-1 per-round logging with malicious counts (local IDs)
+            added_local_sorted = sorted(list(next_front))
+            added_client_ids = [client_ids[i] for i in added_local_sorted]
+            malicious_added = [cid for cid in added_client_ids if cid < self.args.num_corrupt]
+            logging.info(f"[ScopeMM][Branch1][Round {round_idx}] 新加入恶意客户端数: {len(malicious_added)} | 恶意客户端局部ID: {malicious_added}")
+            logging.info(f"[ScopeMM][Branch1][Round {round_idx}] 本轮加入客户端个数: {len(next_front)}")
+            cluster |= next_front
+            visited |= next_front
+            front = next_front
+            cur_percent /= 2.0
+            round_idx += 1
+        selected = sorted(list(cluster))
+
+        # Weighted average of selected updates
+        if len(selected) == 0:
+            return torch.zeros_like(local_updates[0])
+        selected_ids = [client_ids[i] for i in selected]
+        total = 0.0
+        for cid in selected_ids:
+            total += float(self.agent_data_sizes[cid])
+        if total <= 0:
+            weights = [1.0 / len(selected)] * len(selected)
+        else:
+            weights = [float(self.agent_data_sizes[cid]) / total for cid in selected_ids]
+        stacked = torch.stack([local_updates[i] for i in selected], dim=0)
+        w_tensor = torch.tensor(weights, device=stacked.device, dtype=stacked.dtype).view(-1, 1)
+        aggregated = torch.sum(stacked * w_tensor, dim=0)
+
+        # Metrics logging similar to reference
+        benign_idx = selected
+        correct = 0
+        for idx in benign_idx:
+            if client_ids[idx] >= self.args.num_corrupt:
+                correct += 1
+        TPR = correct / len(benign_id) if len(benign_id) > 0 else 0.0
+        if len(malicious_id) == 0:
+            FPR = 0.0
+        else:
+            wrong = 0
+            for idx in benign_idx:
+                if client_ids[idx] < self.args.num_corrupt:
+                    wrong += 1
+            FPR = wrong / len(malicious_id)
+        logging.info('benign update index:   %s' % str(benign_id))
+        logging.info('selected update index: %s' % str(benign_idx))
+        logging.info('FPR:       %.4f' % FPR)
+        logging.info('TPR:       %.4f' % TPR)
+        self.tpr_history.append(TPR)
+        self.fpr_history.append(FPR)
+        return aggregated
+
+    def agg_scope(self, agent_updates_dict, global_model, flat_global_model):
+        """
+        Scope aggregation method.
+        - Build per-client model vectors as (flat_global_model + update)
+        - Compute relative change pre-metric
+        - Compute cosine distance matrix
+        - Select seed with minimum distance sum
+        - Greedy cluster expansion
+        - Weighted average of selected updates by agent_data_sizes
+        """
+        eps = getattr(self.args, "eps", 1e-12)
+        
+        # Maintain client id order for weighting and build label lists
+        client_ids = []
+        local_updates = []
+        benign_id = []
+        malicious_id = []
+        for _id, update in agent_updates_dict.items():
+            client_ids.append(_id)
+            local_updates.append(update)
+            if _id < self.args.num_corrupt:
+                malicious_id.append(_id)
+            else:
+                benign_id.append(_id)
+
+        # Build client model vectors (numpy)
+        vectorize_global = flat_global_model.detach().cpu().numpy()
+        vectorize_nets = []
+        for upd in local_updates:
+            vectorize_nets.append((flat_global_model + upd).detach().cpu().numpy())
+
+        n = len(vectorize_nets)
+        if n == 0:
+            return torch.zeros_like(flat_global_model)
+        if n == 1:
+            return local_updates[0]
+
+        # Compute pre-metric (relative change)
+        pre_metric_dis = []
+        for i, g_i in enumerate(vectorize_nets):
+            pre_metric = np.power(
+                np.abs(g_i - vectorize_global) / (np.abs(g_i) + np.abs(vectorize_global) + eps),
+                2.0
+            ) * np.sign(g_i - vectorize_global)
+            pre_metric_dis.append(pre_metric)
+
+        # Compute cosine distance matrix
+        sum_dis = [0.0] * n
+        cos_dis = np.zeros((n, n), dtype=np.float64)
+        for i, g_i in enumerate(pre_metric_dis):
+            norm_i = np.linalg.norm(g_i)
+            if norm_i < eps:
+                norm_i = eps
+            for j in range(i, n):
+                if i == j:
+                    # Diagonal element: distance to self is 0
+                    cos_dis[i, j] = 0.0
+                else:
+                    g_j = pre_metric_dis[j]
+                    norm_j = np.linalg.norm(g_j)
+                    if norm_j < eps:
+                        norm_j = eps
+                    cosine_distance = float(1.0 - (np.dot(g_i, g_j) / (norm_i * norm_j)))
+                    if abs(cosine_distance) < 0.000001:
+                        cosine_distance = 100.0
+                    cos_dis[i, j] = cosine_distance
+                    cos_dis[j, i] = cosine_distance
+                    sum_dis[i] += cosine_distance
+                    sum_dis[j] += cosine_distance
+
+        # Select seed with minimum distance sum
+        choice = int(np.argmin(sum_dis))
+        cluster = [choice]
+        
+        # Greedy cluster expansion
+        for i in range(n):
+            tmp = int(np.argmin(cos_dis[choice]))
+            if tmp not in cluster:
+                cluster.append(tmp)
+            else:
+                break
+            choice = tmp
+
+        logging.info(f"[Scope] Selected cluster indices: {cluster}")
+        logging.info(f"[Scope] Selected client IDs: {[client_ids[i] for i in cluster]}")
+
+        # Weighted average of selected updates by agent_data_sizes
+        if len(cluster) == 0:
+            return torch.zeros_like(local_updates[0])
+        
+        selected_ids = [client_ids[i] for i in cluster]
+        total = 0.0
+        for cid in selected_ids:
+            total += float(self.agent_data_sizes[cid])
+        
+        if total <= 0:
+            weights = [1.0 / len(cluster)] * len(cluster)
+        else:
+            weights = [float(self.agent_data_sizes[cid]) / total for cid in selected_ids]
+        
+        stacked = torch.stack([local_updates[i] for i in cluster], dim=0)
+        w_tensor = torch.tensor(weights, device=stacked.device, dtype=stacked.dtype).view(-1, 1)
+        aggregated = torch.sum(stacked * w_tensor, dim=0)
+
+        # Metrics logging
+        correct = 0
+        for idx in cluster:
+            if client_ids[idx] >= self.args.num_corrupt:
+                correct += 1
+        TPR = correct / len(benign_id) if len(benign_id) > 0 else 0.0
+        
+        if len(malicious_id) == 0:
+            FPR = 0.0
+        else:
+            wrong = 0
+            for idx in cluster:
+                if client_ids[idx] < self.args.num_corrupt:
+                    wrong += 1
+            FPR = wrong / len(malicious_id)
+        
+        logging.info('benign update index:   %s' % str(benign_id))
+        logging.info('selected update index: %s' % str([client_ids[i] for i in cluster]))
+        logging.info('FPR:       %.4f' % FPR)
+        logging.info('TPR:       %.4f' % TPR)
+        
+        return aggregated
