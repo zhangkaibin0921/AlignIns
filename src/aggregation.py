@@ -800,13 +800,21 @@ class Aggregation():
         choice = int(np.argmin(sum_dis))
         cluster = [choice]
         
-        # Greedy cluster expansion
+        # Greedy cluster expansion: find closest client to current choice, excluding those already in cluster
         for i in range(n):
-            tmp = int(np.argmin(cos_dis[choice]))
-            if tmp not in cluster:
-                cluster.append(tmp)
-            else:
+            # Get distances from current choice to all clients
+            distances_from_choice = cos_dis[choice].copy()
+            # Set distances to clients already in cluster to a large value (infinity)
+            # so they won't be selected
+            for idx in cluster:
+                distances_from_choice[idx] = np.inf
+            # Find the closest client not in cluster
+            tmp = int(np.argmin(distances_from_choice))
+            # If all remaining clients have infinite distance (shouldn't happen), break
+            if distances_from_choice[tmp] == np.inf:
                 break
+            # Add the closest client to cluster
+            cluster.append(tmp)
             choice = tmp
 
         logging.info(f"[Scope] Selected cluster indices: {cluster}")

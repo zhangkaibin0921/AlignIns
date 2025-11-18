@@ -145,7 +145,7 @@ if __name__ == "__main__":
     parser.add_argument("--combine_method", type=str, default="max", choices=["max", "euclidean", "mahalanobis", "fedid_dynamic"], help="method to combine multiple metrics in ScopeMM")
     parser.add_argument("--use_candidate_seed", action="store_true", default=False, help="use candidate seed selection in ScopeMM wave expansion")
     parser.add_argument("--use_mpsa_prefilter", action="store_true", default=False, help="use MPSA prefilter in ScopeMM")
-    parser.add_argument("--candidate_seed_ratio", type=float, default=0.25, help="ratio of candidates for seed selection in ScopeMM")
+    parser.add_argument("--candidate_seed_ratio", type=float, default=0.5, help="ratio of candidates for seed selection in ScopeMM")
     parser.add_argument("--fedid_reg", type=float, default=1e-3, help="regularization coefficient for FedID dynamic weighting in ScopeMM")
 
     args = parser.parse_args()
