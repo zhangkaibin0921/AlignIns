@@ -693,6 +693,7 @@ class Aggregation():
             added_local_sorted = sorted(list(next_front))
             added_client_ids = [client_ids[i] for i in added_local_sorted]
             malicious_added = [cid for cid in added_client_ids if cid < self.args.num_corrupt]
+            logging.info(f"[ScopeMM][Branch1][Round {round_idx}] 新加入客户端ID: {added_client_ids}")
             logging.info(f"[ScopeMM][Branch1][Round {round_idx}] 新加入恶意客户端数: {len(malicious_added)} | 恶意客户端局部ID: {malicious_added}")
             logging.info(f"[ScopeMM][Branch1][Round {round_idx}] 本轮加入客户端个数: {len(next_front)}")
             cluster |= next_front
@@ -794,10 +795,13 @@ class Aggregation():
         seed_idx = choice
         logging.info(f"[Scope] Seed local index: {seed_idx}, client ID: {client_ids[seed_idx]}")
         cluster = [choice]
+        round_idx = 1
         for _ in range(n):
             tmp = int(np.argmin(cos_dis[choice]))
             if tmp not in cluster:
                 cluster.append(tmp)
+                logging.info(f"[Scope][Round {round_idx}] Added client ID: {client_ids[tmp]} (local idx: {tmp})")
+                round_idx += 1
             else:
                 break
             choice = tmp
