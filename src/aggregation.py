@@ -728,17 +728,8 @@ class Aggregation():
 
     def agg_scope(self, agent_updates_dict, global_model, flat_global_model):
         """
-        Scope aggregation method.
-        - Build per-client model vectors as (flat_global_model + update)
-        - Compute relative change pre-metric
-        - Compute cosine distance matrix
-        - Select seed with minimum distance sum
-        - Greedy cluster expansion
-        - Weighted average of selected updates by agent_data_sizes
+        Scope aggregation method following the original implementation.
         """
-        eps = getattr(self.args, "eps", 1e-12)
-        
-        # Maintain client id order for weighting and build label lists
         client_ids = []
         local_updates = []
         benign_id = []
@@ -751,7 +742,6 @@ class Aggregation():
             else:
                 benign_id.append(_id)
 
-        # Build client model vectors (numpy)
         vectorize_global = flat_global_model.detach().cpu().numpy()
         vectorize_nets = []
         for upd in local_updates:
@@ -763,88 +753,62 @@ class Aggregation():
         if n == 1:
             return local_updates[0]
 
-        # Compute pre-metric (relative change)
-        pre_metric_dis = []
+        pre_metric_dis = [0.0] * n
         for i, g_i in enumerate(vectorize_nets):
             pre_metric = np.power(
-                np.abs(g_i - vectorize_global) / (np.abs(g_i) + np.abs(vectorize_global) + eps),
-                2.0
+                np.abs(g_i - vectorize_global) / (np.abs(g_i) + np.abs(vectorize_global) + 1e-12),
+                2,
             ) * np.sign(g_i - vectorize_global)
-            pre_metric_dis.append(pre_metric)
+            pre_metric_dis[i] = pre_metric
 
-        # Compute cosine distance matrix
         sum_dis = [0.0] * n
-        cos_dis = np.zeros((n, n), dtype=np.float64)
+        cos_dis = np.zeros((n, n))
         for i, g_i in enumerate(pre_metric_dis):
-            norm_i = np.linalg.norm(g_i)
-            if norm_i < eps:
-                norm_i = eps
+            norm_i = np.linalg.norm(g_i) + 1e-12
             for j in range(i, n):
-                if i == j:
-                    # Diagonal element: distance to self is 0
-                    cos_dis[i, j] = 0.0
-                else:
-                    g_j = pre_metric_dis[j]
-                    norm_j = np.linalg.norm(g_j)
-                    if norm_j < eps:
-                        norm_j = eps
-                    cosine_distance = float(1.0 - (np.dot(g_i, g_j) / (norm_i * norm_j)))
-                    if abs(cosine_distance) < 0.000001:
-                        cosine_distance = 100.0
-                    cos_dis[i, j] = cosine_distance
-                    cos_dis[j, i] = cosine_distance
-                    sum_dis[i] += cosine_distance
-                    sum_dis[j] += cosine_distance
+                g_j = pre_metric_dis[j]
+                norm_j = np.linalg.norm(g_j) + 1e-12
+                cosine_distance = float(1 - (np.dot(g_i, g_j) / (norm_i * norm_j)))
+                if abs(cosine_distance) < 0.000001:
+                    cosine_distance = 100
+                cos_dis[i, j] = cosine_distance
+                cos_dis[j, i] = cosine_distance
+                sum_dis[i] += cosine_distance
+                sum_dis[j] += cosine_distance
 
-        # Select seed with minimum distance sum
         choice = int(np.argmin(sum_dis))
         cluster = [choice]
-        
-        # Greedy cluster expansion: find closest client to current choice, excluding those already in cluster
-        for i in range(n):
-            # Get distances from current choice to all clients
-            distances_from_choice = cos_dis[choice].copy()
-            # Set distances to clients already in cluster to a large value (infinity)
-            # so they won't be selected
-            for idx in cluster:
-                distances_from_choice[idx] = np.inf
-            # Find the closest client not in cluster
-            tmp = int(np.argmin(distances_from_choice))
-            # If all remaining clients have infinite distance (shouldn't happen), break
-            if distances_from_choice[tmp] == np.inf:
+        for _ in range(n):
+            tmp = int(np.argmin(cos_dis[choice]))
+            if tmp not in cluster:
+                cluster.append(tmp)
+            else:
                 break
-            # Add the closest client to cluster
-            cluster.append(tmp)
             choice = tmp
 
         logging.info(f"[Scope] Selected cluster indices: {cluster}")
         logging.info(f"[Scope] Selected client IDs: {[client_ids[i] for i in cluster]}")
 
-        # Weighted average of selected updates by agent_data_sizes
-        if len(cluster) == 0:
-            return torch.zeros_like(local_updates[0])
-        
         selected_ids = [client_ids[i] for i in cluster]
         total = 0.0
         for cid in selected_ids:
             total += float(self.agent_data_sizes[cid])
-        
+
         if total <= 0:
             weights = [1.0 / len(cluster)] * len(cluster)
         else:
             weights = [float(self.agent_data_sizes[cid]) / total for cid in selected_ids]
-        
+
         stacked = torch.stack([local_updates[i] for i in cluster], dim=0)
         w_tensor = torch.tensor(weights, device=stacked.device, dtype=stacked.dtype).view(-1, 1)
         aggregated = torch.sum(stacked * w_tensor, dim=0)
 
-        # Metrics logging
         correct = 0
         for idx in cluster:
             if client_ids[idx] >= self.args.num_corrupt:
                 correct += 1
         TPR = correct / len(benign_id) if len(benign_id) > 0 else 0.0
-        
+
         if len(malicious_id) == 0:
             FPR = 0.0
         else:
@@ -853,10 +817,10 @@ class Aggregation():
                 if client_ids[idx] < self.args.num_corrupt:
                     wrong += 1
             FPR = wrong / len(malicious_id)
-        
+
         logging.info('benign update index:   %s' % str(benign_id))
         logging.info('selected update index: %s' % str([client_ids[i] for i in cluster]))
         logging.info('FPR:       %.4f' % FPR)
         logging.info('TPR:       %.4f' % TPR)
-        
+
         return aggregated
