@@ -528,6 +528,19 @@ class Aggregation():
             combined_D = np.sqrt(np.maximum(cosZ, 0.0) ** 2 + np.maximum(l1Z, 0.0) ** 2 + np.maximum(l2Z, 0.0) ** 2)
         elif combine_method == "max":
             combined_D = np.maximum.reduce([cosZ, l1Z, l2Z])
+        elif combine_method == "scope":
+            for i in range(n):
+                gi = pre_metric_dis[i]
+                ni = np.linalg.norm(gi)
+                ni = ni if ni > eps else eps
+                for j in range(i + 1, n):
+                    gj = pre_metric_dis[j]
+                    nj = np.linalg.norm(gj)
+                    nj = nj if nj > eps else eps
+                    cosine_distance = float(1.0 - (np.dot(gi, gj) / (ni * nj)))
+                    if abs(cosine_distance) < 0.000001:
+                        cosine_distance = 100.0
+                    combined_D[i, j] = combined_D[j, i] = cosine_distance
         elif combine_method == "mahalanobis":
             idx_i, idx_j = np.triu_indices(n, k=1)
             feats = np.stack([cosZ[idx_i, idx_j], l1Z[idx_i, idx_j], l2Z[idx_i, idx_j]], axis=1)

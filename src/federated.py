@@ -142,7 +142,7 @@ if __name__ == "__main__":
     # ScopeMM aggregation method parameters
     parser.add_argument("--eps", type=float, default=1e-12, help="epsilon for numerical stability in ScopeMM")
     parser.add_argument("--percent_select", type=float, default=20.0, help="percentage of clients to select per wave expansion round in ScopeMM")
-    parser.add_argument("--combine_method", type=str, default="max", choices=["max", "euclidean", "mahalanobis", "fedid_dynamic"], help="method to combine multiple metrics in ScopeMM")
+    parser.add_argument("--combine_method", type=str, default="max", choices=["max", "euclidean", "mahalanobis", "fedid_dynamic", "scope"], help="method to combine multiple metrics in ScopeMM")
     parser.add_argument("--use_candidate_seed", action="store_true", default=False, help="use candidate seed selection in ScopeMM wave expansion")
     parser.add_argument("--use_mpsa_prefilter", action="store_true", default=False, help="use MPSA prefilter in ScopeMM")
     parser.add_argument("--candidate_seed_ratio", type=float, default=0.5, help="ratio of candidates for seed selection in ScopeMM")
