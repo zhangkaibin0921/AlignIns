@@ -799,15 +799,32 @@ class Aggregation():
                 l1_mat[i, j] = l1_mat[j, i] = manhattan_distance
                 l2_mat[i, j] = l2_mat[j, i] = euclidean_distance
 
-        # z-score each metric using upper triangle stats
+
         std_mats = []
+        # z-score each metric using upper triangle stats   zscore的方式有负数
+
+        # for M in (cos_mat, l1_mat, l2_mat):
+        #     triu = M[np.triu_indices_from(M, k=1)]
+        #     mean = np.mean(triu) if triu.size > 0 else 0.0
+        #     std = np.std(triu) if triu.size > 0 else 1.0
+        #     std = std if std > eps else 1.0
+        #     Z = (M - mean) / std
+        #     std_mats.append(Z)
+
         for M in (cos_mat, l1_mat, l2_mat):
-            triu = M[np.triu_indices_from(M, k=1)]
-            mean = np.mean(triu) if triu.size > 0 else 0.0
-            std = np.std(triu) if triu.size > 0 else 1.0
-            std = std if std > eps else 1.0
-            Z = (M - mean) / std
+            triu = M[np.triu_indices_from(M, k=1)]  # 取上三角（不含对角线）的距离值（避免对角线0值影响极值计算）
+            if triu.size == 0:
+                # 无有效距离值（仅1个客户端，实际前面已处理n=1的情况），直接返回全0矩阵
+                Z = np.zeros_like(M)
+            else:
+                min_val = np.min(triu)
+                max_val = np.max(triu)
+                # 避免分母为0（所有距离相同），添加eps保护
+                denominator = max_val - min_val + eps
+                # Min-Max 公式：Z = (M - min_val) / denominator，缩放到 [0, 1]
+                Z = (M - min_val) / denominator
             std_mats.append(Z)
+
         cosZ, l1Z, l2Z = std_mats
 
         # Combine metrics based on combine_method
@@ -882,7 +899,15 @@ class Aggregation():
         # if combine_method == "scope":
         #     sum_dis = np.sum(combined_D, axis=1)
         # else:
-        sum_dis = np.sum(combined_D, axis=1) - np.diag(combined_D)
+
+        np.fill_diagonal(combined_D, np.inf)
+        # sum_dis = np.sum(combined_D, axis=1) - np.diag(combined_D)
+        sum_dis = []
+        for i in range(n):
+            # 只计算当前客户端与其他所有客户端的距离和（排除自己）
+            other_distances = combined_D[i, np.arange(n) != i]
+            sum_dis.append(np.sum(other_distances))
+        sum_dis = np.array(sum_dis)
 
         # Candidate seed selection logic (similar to agg_scope_multimetric)
         use_candidate_seed = getattr(self.args, "use_candidate_seed", False)
