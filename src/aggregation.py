@@ -743,8 +743,13 @@ class Aggregation():
 
     def agg_scope(self, agent_updates_dict, global_model, flat_global_model):
         """
-        Scope aggregation method following the original implementation.
+        Scope aggregation method with support for multiple combine methods.
         """
+        # Get parameters
+        eps = getattr(self.args, "eps", 1e-12)
+        combine_method = getattr(self.args, "combine_method", "scope")  # Default to "scope" for backward compatibility
+        self.fedid_reg = float(getattr(self.args, "fedid_reg", 1e-3))
+        
         client_ids = []
         local_updates = []
         benign_id = []
@@ -768,32 +773,113 @@ class Aggregation():
         if n == 1:
             return local_updates[0]
 
-        pre_metric_dis = [0.0] * n
-        for i, g_i in enumerate(vectorize_nets):
+        # Compute relative change pre-metric
+        pre_metric_dis = []
+        for g_i in vectorize_nets:
             pre_metric = np.power(
-                np.abs(g_i - vectorize_global) / (np.abs(g_i) + np.abs(vectorize_global) + 1e-12),
-                2,
+                np.abs(g_i - vectorize_global) / (np.abs(g_i) + np.abs(vectorize_global) + eps),
+                2.0,
             ) * np.sign(g_i - vectorize_global)
-            pre_metric_dis[i] = pre_metric
+            pre_metric_dis.append(pre_metric)
 
-        sum_dis = [0.0] * n
-        cos_dis = np.zeros((n, n))
-        for i, g_i in enumerate(pre_metric_dis):
-            norm_i = np.linalg.norm(g_i) + 1e-12
-            for j in range(i, n):
-                g_j = pre_metric_dis[j]
-                norm_j = np.linalg.norm(g_j) + 1e-12
-                cosine_distance = float(1 - (np.dot(g_i, g_j) / (norm_i * norm_j)))
-                if abs(cosine_distance) < 0.000001:
-                    cosine_distance = 100
-                cos_dis[i, j] = cosine_distance
-                cos_dis[j, i] = cosine_distance
-                sum_dis[i] += cosine_distance
-                sum_dis[j] += cosine_distance
+        # Multi-metric pairwise distances
+        cos_mat = np.zeros((n, n), dtype=np.float64)
+        l1_mat = np.zeros((n, n), dtype=np.float64)
+        l2_mat = np.zeros((n, n), dtype=np.float64)
+        for i in range(n):
+            gi = pre_metric_dis[i]
+            ni = np.linalg.norm(gi) + eps
+            for j in range(i + 1, n):
+                gj = pre_metric_dis[j]
+                nj = np.linalg.norm(gj) + eps
+                cosine_distance = float(1.0 - (np.dot(gi, gj) / (ni * nj)))
+                manhattan_distance = float(np.linalg.norm(gi - gj, ord=1))
+                euclidean_distance = float(np.linalg.norm(gi - gj))
+                cos_mat[i, j] = cos_mat[j, i] = cosine_distance
+                l1_mat[i, j] = l1_mat[j, i] = manhattan_distance
+                l2_mat[i, j] = l2_mat[j, i] = euclidean_distance
+
+        # z-score each metric using upper triangle stats
+        std_mats = []
+        for M in (cos_mat, l1_mat, l2_mat):
+            triu = M[np.triu_indices_from(M, k=1)]
+            mean = np.mean(triu) if triu.size > 0 else 0.0
+            std = np.std(triu) if triu.size > 0 else 1.0
+            std = std if std > eps else 1.0
+            Z = (M - mean) / std
+            std_mats.append(Z)
+        cosZ, l1Z, l2Z = std_mats
+
+        # Combine metrics based on combine_method
+        combined_D = np.zeros((n, n), dtype=np.float64)
+        if combine_method == "euclidean":
+            combined_D = np.sqrt(np.maximum(cosZ, 0.0) ** 2 + np.maximum(l1Z, 0.0) ** 2 + np.maximum(l2Z, 0.0) ** 2)
+        elif combine_method == "max":
+            combined_D = np.maximum.reduce([cosZ, l1Z, l2Z])
+        elif combine_method == "scope":
+            # Original scope method: use cosine distance with special handling
+            for i in range(n):
+                gi = pre_metric_dis[i]
+                ni = np.linalg.norm(gi)
+                ni = ni if ni > eps else eps
+                for j in range(i + 1, n):
+                    gj = pre_metric_dis[j]
+                    nj = np.linalg.norm(gj)
+                    nj = nj if nj > eps else eps
+                    cosine_distance = float(1.0 - (np.dot(gi, gj) / (ni * nj)))
+                    if abs(cosine_distance) < 0.000001:
+                        cosine_distance = 100.0
+                    combined_D[i, j] = combined_D[j, i] = cosine_distance
+        elif combine_method == "mahalanobis":
+            idx_i, idx_j = np.triu_indices(n, k=1)
+            feats = np.stack([cosZ[idx_i, idx_j], l1Z[idx_i, idx_j], l2Z[idx_i, idx_j]], axis=1)
+            cov = np.cov(feats.T)
+            try:
+                inv = np.linalg.inv(cov)
+            except np.linalg.LinAlgError:
+                inv = np.eye(3)
+            for i in range(n):
+                for j in range(i + 1, n):
+                    v = np.array([cosZ[i, j], l1Z[i, j], l2Z[i, j]])
+                    d = float(v.T @ inv @ v)
+                    combined_D[i, j] = combined_D[j, i] = d
+        elif combine_method == "fedid_dynamic":
+            # FedID dynamic weighting strategy
+            client_features = np.zeros((n, 3), dtype=np.float64)
+            for i in range(n):
+                mask = np.arange(n) != i
+                client_features[i, 0] = np.sum(cosZ[i, mask])
+                client_features[i, 1] = np.sum(l1Z[i, mask])
+                client_features[i, 2] = np.sum(l2Z[i, mask])
+
+            cov_matrix = np.cov(client_features.T)
+            reg_cov = cov_matrix + self.fedid_reg * np.eye(3)
+            try:
+                concentration_matrix = np.linalg.inv(reg_cov)
+                logging.info(f"[Scope][FedID动态加权] 浓度矩阵计算完成，正则化系数={self.fedid_reg}")
+            except np.linalg.LinAlgError:
+                concentration_matrix = np.eye(3)
+                logging.warning("[Scope][FedID动态加权] 协方差矩阵奇异，退化为单位矩阵加权")
+
+            for i in range(n):
+                for j in range(i + 1, n):
+                    dist_vec = np.array([cosZ[i, j], l1Z[i, j], l2Z[i, j]])
+                    dynamic_dist = dist_vec.T @ concentration_matrix @ dist_vec
+                    combined_D[i, j] = combined_D[j, i] = max(dynamic_dist, 0.0)
+        else:
+            # Default: euclidean combination
+            combined_D = np.sqrt(np.maximum(cosZ, 0.0) ** 2 + np.maximum(l1Z, 0.0) ** 2 + np.maximum(l2Z, 0.0) ** 2)
+        
+        np.fill_diagonal(combined_D, 0.0)
+        
+        # Calculate sum_dis using combined_D
+        sum_dis = np.sum(combined_D, axis=1)
 
         # Candidate seed selection logic (similar to agg_scope_multimetric)
         use_candidate_seed = getattr(self.args, "use_candidate_seed", False)
         candidate_seed_ratio = float(getattr(self.args, "candidate_seed_ratio", 0.5))
+        
+        logging.info(f"[Scope] Using combine_method: {combine_method}")
         
         if use_candidate_seed:
             # Select candidate seeds from all clients based on sum_dis
@@ -813,7 +899,7 @@ class Aggregation():
                     if len(other_candidates) == 0:
                         dist_sum = 0.0
                     else:
-                        dist_sum = np.sum(cos_dis[seed, other_candidates])
+                        dist_sum = np.sum(combined_D[seed, other_candidates])
                     candidate_dist_sum.append(dist_sum)
                 best_candidate_idx = int(np.argmin(candidate_dist_sum))
                 seed_idx = candidate_seeds[best_candidate_idx]
@@ -827,7 +913,7 @@ class Aggregation():
         cluster = [choice]
         round_idx = 1
         for _ in range(n):
-            tmp = int(np.argmin(cos_dis[choice]))
+            tmp = int(np.argmin(combined_D[choice]))
             if tmp not in cluster:
                 cluster.append(tmp)
                 logging.info(f"[Scope][Round {round_idx}] Added client ID: {client_ids[tmp]} (local idx: {tmp})")
