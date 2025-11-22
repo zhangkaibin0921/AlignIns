@@ -791,8 +791,38 @@ class Aggregation():
                 sum_dis[i] += cosine_distance
                 sum_dis[j] += cosine_distance
 
-        choice = int(np.argmin(sum_dis))
-        seed_idx = choice
+        # Candidate seed selection logic (similar to agg_scope_multimetric)
+        use_candidate_seed = getattr(self.args, "use_candidate_seed", False)
+        candidate_seed_ratio = float(getattr(self.args, "candidate_seed_ratio", 0.5))
+        
+        if use_candidate_seed:
+            # Select candidate seeds from all clients based on sum_dis
+            num_candidates = max(1, int(n * candidate_seed_ratio))
+            sorted_candidate_indices = np.argsort(sum_dis)[:num_candidates]
+            candidate_seeds = sorted_candidate_indices.tolist()
+            logging.info(
+                f"[Scope][种子选择] 候选种子比例：{candidate_seed_ratio}，候选种子局部索引：{candidate_seeds}，候选种子客户端ID：{[client_ids[i] for i in candidate_seeds]}，共{len(candidate_seeds)}个")
+            
+            if len(candidate_seeds) == 1:
+                seed_idx = candidate_seeds[0]
+            else:
+                # Calculate distance sum for each candidate seed with other candidates
+                candidate_dist_sum = []
+                for seed in candidate_seeds:
+                    other_candidates = [s for s in candidate_seeds if s != seed]
+                    if len(other_candidates) == 0:
+                        dist_sum = 0.0
+                    else:
+                        dist_sum = np.sum(cos_dis[seed, other_candidates])
+                    candidate_dist_sum.append(dist_sum)
+                best_candidate_idx = int(np.argmin(candidate_dist_sum))
+                seed_idx = candidate_seeds[best_candidate_idx]
+                logging.info(f"[Scope][种子校验] 候选种子距离和：{candidate_dist_sum}，最终选择种子局部索引：{seed_idx}，客户端ID：{client_ids[seed_idx]}")
+        else:
+            # Original logic: select the client with minimum sum_dis
+            seed_idx = int(np.argmin(sum_dis))
+        
+        choice = seed_idx
         logging.info(f"[Scope] Seed local index: {seed_idx}, client ID: {client_ids[seed_idx]}")
         cluster = [choice]
         round_idx = 1
