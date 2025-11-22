@@ -588,8 +588,7 @@ class Aggregation():
                     combined_D[i, j] = combined_D[j, i] = max(dynamic_dist, 0.0)
         else:
             combined_D = np.sqrt(np.maximum(cosZ, 0.0) ** 2 + np.maximum(l1Z, 0.0) ** 2 + np.maximum(l2Z, 0.0) ** 2)
-        # 统一处理对角线：所有方法都设置为无穷大，避免argmin/argsort选择自己
-        np.fill_diagonal(combined_D, np.inf)
+        np.fill_diagonal(combined_D, 0.0)
 
         # MPSA prefilter on updates (torch)
         if use_mpsa_prefilter:
@@ -819,11 +818,12 @@ class Aggregation():
             combined_D = np.maximum.reduce([cosZ, l1Z, l2Z])
         elif combine_method == "scope":
             # Original scope method: use cosine distance with special handling
+            # 注意：循环包含 i == j，显式计算对角线（自己到自己的距离为0）
             for i in range(n):
                 gi = pre_metric_dis[i]
                 ni = np.linalg.norm(gi)
                 ni = ni if ni > eps else eps
-                for j in range(i + 1, n):
+                for j in range(i, n):  # 包含 i == j，与原始实现一致
                     gj = pre_metric_dis[j]
                     nj = np.linalg.norm(gj)
                     nj = nj if nj > eps else eps
@@ -871,11 +871,16 @@ class Aggregation():
             # Default: euclidean combination
             combined_D = np.sqrt(np.maximum(cosZ, 0.0) ** 2 + np.maximum(l1Z, 0.0) ** 2 + np.maximum(l2Z, 0.0) ** 2)
         
-        # 统一处理对角线：所有方法都设置为无穷大，避免argmin/argsort选择自己
-        np.fill_diagonal(combined_D, np.inf)
+        # 处理对角线：scope方法已在循环中显式计算为100.0，其他方法设置为inf避免argmin选择自己
+        if combine_method != "scope":
+            np.fill_diagonal(combined_D, np.inf)
         
         # Calculate sum_dis using combined_D
-        sum_dis = np.sum(combined_D, axis=1)
+        # 对于非scope方法，计算sum_dis时需要排除对角线（因为对角线是inf）
+        if combine_method == "scope":
+            sum_dis = np.sum(combined_D, axis=1)
+        else:
+            sum_dis = np.sum(combined_D, axis=1) - np.diag(combined_D)
 
         # Candidate seed selection logic (similar to agg_scope_multimetric)
         use_candidate_seed = getattr(self.args, "use_candidate_seed", False)
