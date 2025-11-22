@@ -588,7 +588,8 @@ class Aggregation():
                     combined_D[i, j] = combined_D[j, i] = max(dynamic_dist, 0.0)
         else:
             combined_D = np.sqrt(np.maximum(cosZ, 0.0) ** 2 + np.maximum(l1Z, 0.0) ** 2 + np.maximum(l2Z, 0.0) ** 2)
-        np.fill_diagonal(combined_D, 0.0)
+        # 统一处理对角线：所有方法都设置为无穷大，避免argmin/argsort选择自己
+        np.fill_diagonal(combined_D, np.inf)
 
         # MPSA prefilter on updates (torch)
         if use_mpsa_prefilter:
@@ -870,7 +871,8 @@ class Aggregation():
             # Default: euclidean combination
             combined_D = np.sqrt(np.maximum(cosZ, 0.0) ** 2 + np.maximum(l1Z, 0.0) ** 2 + np.maximum(l2Z, 0.0) ** 2)
         
-        np.fill_diagonal(combined_D, 0.0)
+        # 统一处理对角线：所有方法都设置为无穷大，避免argmin/argsort选择自己
+        np.fill_diagonal(combined_D, np.inf)
         
         # Calculate sum_dis using combined_D
         sum_dis = np.sum(combined_D, axis=1)
