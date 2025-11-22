@@ -133,6 +133,7 @@ if __name__ == "__main__":
     parser.add_argument("--same_mask", type=int, default=1)
     parser.add_argument("--cease_poison", type=float, default=100000)
     parser.add_argument("--exp_name_extra", type=str, help="defence name", default="")
+    parser.add_argument("--pretrained_path", type=str, default=None, help="path to pretrained model checkpoint for ResNet9 (CIFAR-10) or VGG9 (CIFAR-100)")
     parser.add_argument("--super_power", action="store_true")
     parser.add_argument("--clean", action="store_true")
     parser.add_argument("--sparsity", type=float, default=0.3)
@@ -411,3 +412,37 @@ if __name__ == "__main__":
     logging.info("Attack Success Ratio:   %.4f" % best_asr)
     logging.info("Backdoor ACC:           %.4f" % best_bcdr_acc)
     logging.info("Training has finished!")
+    
+    # Save checkpoint at the end of training with parameter information in filename
+    checkpoint_name_parts = [
+        'checkpoint',
+        f'data_{args.data}',
+        f'attack_{args.attack}',
+        f'defense_{args.aggr}',
+        f'corrupt_{args.num_corrupt}',
+        f'poison_{args.poison_frac:.2f}',
+        f'agents_{args.num_agents}',
+        f'rounds_{args.rounds}',
+    ]
+    
+    if args.non_iid:
+        checkpoint_name_parts.append(f'noniid_beta_{args.beta:.2f}')
+    else:
+        checkpoint_name_parts.append('iid')
+    
+    if args.exp_name_extra:
+        checkpoint_name_parts.append(args.exp_name_extra)
+    
+    checkpoint_filename = '_'.join(checkpoint_name_parts) + '.pth'
+    checkpoint_path = os.path.join(args.log_dir, checkpoint_filename)
+    
+    checkpoint = {
+        'model_state_dict': global_model.state_dict(),
+        'best_acc': best_acc,
+        'best_asr': best_asr,
+        'best_bcdr_acc': best_bcdr_acc,
+        'rounds': args.rounds,
+        'args': args,
+    }
+    torch.save(checkpoint, checkpoint_path)
+    logging.info("Checkpoint saved to: %s" % checkpoint_path)
