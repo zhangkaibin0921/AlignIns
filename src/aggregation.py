@@ -365,6 +365,7 @@ class Aggregation():
         lambda_s = float(getattr(self.args, "lambda_s", 1.0))
         eps = getattr(self.args, "eps", 1e-12)
         iqr_mu = float(getattr(self.args, "iqr_mu", 1.5))
+        dist_iqr_mu = float(getattr(self.args, "distance_iqr_mu", 0.75))
 
         malicious_id = []
         benign_id = []
@@ -499,8 +500,10 @@ class Aggregation():
             q1 = torch.quantile(dist_tensor, 0.25).item()
             q3 = torch.quantile(dist_tensor, 0.75).item()
             iqr = q3 - q1
-            lower = q1 - iqr_mu * iqr
-            upper = q3 + iqr_mu * iqr
+            lower = q1 - dist_iqr_mu * iqr
+            upper = q3 + dist_iqr_mu * iqr
+            lower = 0
+            upper = min(1.0, upper)
             return lower, upper, dists
 
         lower_dist, upper_dist, benign_dists = _distance_stats(clean_indices, temp_update)
