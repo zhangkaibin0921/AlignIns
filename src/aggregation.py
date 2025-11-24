@@ -49,6 +49,8 @@ class Aggregation():
             aggregated_updates = self.agg_scope_multimetric(agent_updates_dict, global_model, cur_global_params)
         elif self.args.aggr == 'scope':
             aggregated_updates = self.agg_scope(agent_updates_dict, global_model, cur_global_params)
+        elif self.args.aggr == 'mpsaguard':
+            aggregated_updates = self.agg_mpsa_guard(agent_updates_dict, global_model, cur_global_params)
         elif self.args.aggr == 'foolsgold':
             aggregated_updates = self.agg_foolsgold(agent_updates_dict)
         elif self.args.aggr == 'signguard':
@@ -349,6 +351,186 @@ class Aggregation():
         update = self.agg_avg(current_dict)
 
         return update
+
+    def agg_mpsa_guard(self, agent_updates_dict, global_model, flat_global_model):
+        """
+        AlignIns-inspired defense:
+        1. Use AlignIns' MPSA pipeline (client ordering, mz-score) to identify candidate benign clients.
+        2. Instead of discarding anomalies, flip their signs toward the clean-majority sign.
+        3. Apply IQR-based magnitude normalization per neuron.
+        4. Aggregate clean clients to form a temporary centroid and only reintroduce corrected suspects
+           if their distance to the centroid lies within the benign distance range.
+        """
+        sparsity = float(getattr(self.args, "sparsity", 0.3))
+        lambda_s = float(getattr(self.args, "lambda_s", 1.0))
+        eps = getattr(self.args, "eps", 1e-12)
+        iqr_mu = float(getattr(self.args, "iqr_mu", 1.5))
+
+        malicious_id = []
+        benign_id = []
+        for _id in agent_updates_dict.keys():
+            if _id < self.args.num_corrupt:
+                malicious_id.append(_id)
+            else:
+                benign_id.append(_id)
+
+        chosen_clients = malicious_id + benign_id
+        num_chosen_clients = len(chosen_clients)
+        if num_chosen_clients == 0:
+            return torch.zeros_like(flat_global_model)
+        if num_chosen_clients == 1:
+            return agent_updates_dict[chosen_clients[0]]
+
+        # AlignIns ordering: stack updates following (malicious + benign) id list
+        local_updates = [agent_updates_dict[cid] for cid in chosen_clients]
+        inter_model_updates = torch.stack(local_updates, dim=0)
+
+        # --- Stage 1: AlignIns' MPSA pipeline to find candidate benign indices ---
+        major_sign = torch.sign(torch.sum(torch.sign(inter_model_updates), dim=0))
+        mpsa_list = []
+        topk_dim = max(1, int(inter_model_updates.shape[1] * sparsity))
+        for i in range(len(inter_model_updates)):
+            _, init_indices = torch.topk(torch.abs(inter_model_updates[i]), topk_dim)
+            mpsa = (
+                torch.sum(
+                    torch.sign(inter_model_updates[i][init_indices]) == major_sign[init_indices]
+                )
+                / torch.numel(inter_model_updates[i][init_indices])
+            ).item()
+            mpsa_list.append(mpsa)
+        logging.info('MPSA: %s' % [round(i, 4) for i in mpsa_list])
+
+        mpsa_std = np.std(mpsa_list) if len(mpsa_list) > 1 else 1e-12
+        mpsa_med = np.median(mpsa_list)
+        mzscore_mpsa = [np.abs(m - mpsa_med) / mpsa_std for m in mpsa_list]
+        logging.info('MZ-score of MPSA: %s' % [round(i, 4) for i in mzscore_mpsa])
+
+        benign_idx_set = set(range(num_chosen_clients))
+        benign_idx_set.intersection_update(
+            set(np.argwhere(np.array(mzscore_mpsa) < lambda_s).flatten().astype(int))
+        )
+        clean_indices = sorted(list(benign_idx_set))
+        suspect_indices = [idx for idx in range(num_chosen_clients) if idx not in benign_idx_set]
+
+        if len(clean_indices) == 0:
+            logging.info("[MPSAGuard] No clients fall below lambda_s, returning zero update.")
+            return torch.zeros_like(local_updates[0])
+
+        # --- Stage 2: Flip suspect signs to match clean-majority orientation ---
+        clean_stack = inter_model_updates[clean_indices]
+        clean_major_sign = torch.sign(torch.sum(torch.sign(clean_stack), dim=0))
+
+        corrected_updates = []
+        for idx, vec in enumerate(local_updates):
+            corrected = vec.clone()
+            if idx in suspect_indices:
+                target_sign = torch.where(clean_major_sign == 0, torch.sign(corrected), clean_major_sign)
+                corrected = corrected.abs() * target_sign
+            corrected_updates.append(corrected)
+
+        corrected_stack = torch.stack(corrected_updates, dim=0)
+        amplitudes = corrected_stack.abs()
+        q1 = torch.quantile(amplitudes, 0.25, dim=0)
+        q3 = torch.quantile(amplitudes, 0.75, dim=0)
+        median_amp = torch.quantile(amplitudes, 0.5, dim=0)
+        iqr = q3 - q1
+        lower_bound = q1 - iqr_mu * iqr
+        upper_bound = q3 + iqr_mu * iqr
+
+        normalized_updates = []
+        for vec in corrected_updates:
+            amp = vec.abs()
+            sign = torch.sign(vec)
+            sign = torch.where(sign == 0, torch.ones_like(sign), sign)
+            adjust_mask = (amp < lower_bound) | (amp > upper_bound)
+            amp = torch.where(adjust_mask, median_amp, amp)
+            normalized_updates.append(sign * amp)
+
+        # Shared helper: data-size weighted averaging with safe fallback
+        def _weighted_average(indices):
+            if len(indices) == 0:
+                return torch.zeros_like(local_updates[0])
+            total = 0.0
+            acc = torch.zeros_like(local_updates[0])
+            for local_idx in indices:
+                cid = chosen_clients[local_idx]
+                weight = float(self.agent_data_sizes[cid])
+                total += weight
+                acc += normalized_updates[local_idx] * weight
+            if total == 0.0:
+                return torch.mean(torch.stack([normalized_updates[i] for i in indices], dim=0), dim=0)
+            return acc / total
+
+        temp_update = _weighted_average(clean_indices)
+
+        # --- Stage 3: distance-based gating using benign centroid statistics ---
+        def _distance_stats(indices, centroid):
+            if len(indices) == 0:
+                return -np.inf, np.inf, []
+            dists = [torch.norm(normalized_updates[idx] - centroid).item() for idx in indices]
+            if len(dists) < 2:
+                return -np.inf, np.inf, dists
+            dist_tensor = torch.tensor(dists, dtype=torch.float64)
+            q1 = torch.quantile(dist_tensor, 0.25).item()
+            q3 = torch.quantile(dist_tensor, 0.75).item()
+            iqr = q3 - q1
+            lower = q1 - iqr_mu * iqr
+            upper = q3 + iqr_mu * iqr
+            return lower, upper, dists
+
+        lower_dist, upper_dist, benign_dists = _distance_stats(clean_indices, temp_update)
+        accepted_suspects = []
+        for idx in suspect_indices:
+            dist = torch.norm(normalized_updates[idx] - temp_update).item()
+            if lower_dist <= dist <= upper_dist:
+                accepted_suspects.append(idx)
+
+        selected_indices = sorted(clean_indices + accepted_suspects)
+        if len(selected_indices) == 0:
+            logging.warning("[MPSAGuard] No clients selected after filtering, returning zero update.")
+            return torch.zeros_like(local_updates[0])
+
+        logging.info(f"[MPSAGuard] Clean indices: {clean_indices}, Accepted suspects: {accepted_suspects}")
+        logging.info(f"[MPSAGuard] Benign distance stats: n={len(benign_dists)}, range=({lower_dist:.4f}, {upper_dist:.4f})")
+
+        def _calc_precision(selected_indices, chosen_ids, actual_benign_ids):
+            selected_count = len(selected_indices)
+            if selected_count == 0:
+                return None, selected_count, 0
+            true_clean_count = 0
+            for idx in selected_indices:
+                actual_id = chosen_ids[idx]
+                if actual_id in actual_benign_ids:
+                    true_clean_count += 1
+            precision = true_clean_count / selected_count
+            return precision, selected_count, true_clean_count
+
+        precision, selected_cnt, selected_clean = _calc_precision(selected_indices, chosen_clients, benign_id)
+        if precision is not None:
+            logging.info(f"[MPSAGuard] Precision: {precision:.4f} | 选中数: {selected_cnt} 真正干净数: {selected_clean}")
+
+        final_update = _weighted_average(selected_indices)
+
+        correct = 0
+        for idx in selected_indices:
+            if chosen_clients[idx] in benign_id:
+                correct += 1
+        TPR = correct / len(benign_id) if len(benign_id) > 0 else 0.0
+
+        FPR = 0.0
+        if len(malicious_id) > 0:
+            wrong = 0
+            for idx in selected_indices:
+                if chosen_clients[idx] in malicious_id:
+                    wrong += 1
+            FPR = wrong / len(malicious_id)
+
+        logging.info('benign update index:   %s' % str(benign_id))
+        logging.info('selected update index: %s' % str([chosen_clients[idx] for idx in selected_indices]))
+        logging.info('FPR:       %.4f' % FPR)
+        logging.info('TPR:       %.4f' % TPR)
+
+        return final_update
    
     def agg_foolsgold(self, agent_updates_dict):
         def foolsgold(updates):
