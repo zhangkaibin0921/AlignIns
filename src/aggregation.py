@@ -412,6 +412,22 @@ class Aggregation():
         clean_indices = sorted(list(benign_idx_set))
         suspect_indices = [idx for idx in range(num_chosen_clients) if idx not in benign_idx_set]
 
+        def _calc_precision(selected_indices, chosen_ids, actual_benign_ids):
+            selected_count = len(selected_indices)
+            if selected_count == 0:
+                return None, selected_count, 0
+            true_clean_count = 0
+            for idx in selected_indices:
+                actual_id = chosen_ids[idx]
+                if actual_id in actual_benign_ids:
+                    true_clean_count += 1
+            precision = true_clean_count / selected_count
+            return precision, selected_count, true_clean_count
+
+        pre_precision, pre_selected_cnt, pre_clean_cnt = _calc_precision(clean_indices, chosen_clients, benign_id)
+        if pre_precision is not None:
+            logging.info(f"[MPSAGuard][MPSA阶段] Precision: {pre_precision:.4f} | 选中数: {pre_selected_cnt} 真正干净数: {pre_clean_cnt}")
+
         if len(clean_indices) == 0:
             logging.info("[MPSAGuard] No clients fall below lambda_s, returning zero update.")
             return torch.zeros_like(local_updates[0])
@@ -504,10 +520,6 @@ class Aggregation():
                     true_clean_count += 1
             precision = true_clean_count / selected_count
             return precision, selected_count, true_clean_count
-
-        precision, selected_cnt, selected_clean = _calc_precision(selected_indices, chosen_clients, benign_id)
-        if precision is not None:
-            logging.info(f"[MPSAGuard] Precision: {precision:.4f} | 选中数: {selected_cnt} 真正干净数: {selected_clean}")
 
         final_update = _weighted_average(selected_indices)
 
