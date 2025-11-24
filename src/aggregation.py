@@ -749,7 +749,7 @@ class Aggregation():
         eps = getattr(self.args, "eps", 1e-12)
         combine_method = getattr(self.args, "combine_method", "scope")  # Default to "scope" for backward compatibility
         self.fedid_reg = float(getattr(self.args, "fedid_reg", 1e-3))
-        
+
         client_ids = []
         local_updates = []
         benign_id = []
@@ -799,7 +799,6 @@ class Aggregation():
                 l1_mat[i, j] = l1_mat[j, i] = manhattan_distance
                 l2_mat[i, j] = l2_mat[j, i] = euclidean_distance
 
-
         std_mats = []
         # z-score each metric using upper triangle stats   zscore的方式有负数
 
@@ -833,6 +832,10 @@ class Aggregation():
             combined_D = np.sqrt(np.maximum(cosZ, 0.0) ** 2 + np.maximum(l1Z, 0.0) ** 2 + np.maximum(l2Z, 0.0) ** 2)
         elif combine_method == "max":
             combined_D = np.maximum.reduce([cosZ, l1Z, l2Z])
+            logging.info("[Scope][max] cosZ: %s" % cosZ.tolist())
+            logging.info("[Scope][max] l1Z: %s" % l1Z.tolist())
+            logging.info("[Scope][max] l2Z: %s" % l2Z.tolist())
+            logging.info("[Scope][max] combined_D: %s" % combined_D.tolist())
         elif combine_method == "scope":
             # Original scope method: use cosine distance with special handling
             # 注意：循环包含 i == j，显式计算对角线（自己到自己的距离为0）
@@ -889,11 +892,11 @@ class Aggregation():
         else:
             # Default: euclidean combination
             combined_D = np.sqrt(np.maximum(cosZ, 0.0) ** 2 + np.maximum(l1Z, 0.0) ** 2 + np.maximum(l2Z, 0.0) ** 2)
-        
+
         # 处理对角线：scope方法已在循环中显式计算为100.0，其他方法设置为inf避免argmin选择自己
         # if combine_method != "scope":
         #     np.fill_diagonal(combined_D, np.inf)
-        
+
         # Calculate sum_dis using combined_D
         # 对于非scope方法，计算sum_dis时需要排除对角线（因为对角线是inf）
         # if combine_method == "scope":
@@ -912,9 +915,9 @@ class Aggregation():
         # Candidate seed selection logic (similar to agg_scope_multimetric)
         use_candidate_seed = getattr(self.args, "use_candidate_seed", False)
         candidate_seed_ratio = float(getattr(self.args, "candidate_seed_ratio", 0.5))
-        
+
         logging.info(f"[Scope] Using combine_method: {combine_method}")
-        
+
         if use_candidate_seed:
             # Select candidate seeds from all clients based on sum_dis
             num_candidates = max(1, int(n * candidate_seed_ratio))
@@ -922,7 +925,7 @@ class Aggregation():
             candidate_seeds = sorted_candidate_indices.tolist()
             logging.info(
                 f"[Scope][种子选择] 候选种子比例：{candidate_seed_ratio}，候选种子局部索引：{candidate_seeds}，候选种子客户端ID：{[client_ids[i] for i in candidate_seeds]}，共{len(candidate_seeds)}个")
-            
+
             if len(candidate_seeds) == 1:
                 seed_idx = candidate_seeds[0]
             else:
@@ -937,11 +940,12 @@ class Aggregation():
                     candidate_dist_sum.append(dist_sum)
                 best_candidate_idx = int(np.argmin(candidate_dist_sum))
                 seed_idx = candidate_seeds[best_candidate_idx]
-                logging.info(f"[Scope][种子校验] 候选种子距离和：{candidate_dist_sum}，最终选择种子局部索引：{seed_idx}，客户端ID：{client_ids[seed_idx]}")
+                logging.info(
+                    f"[Scope][种子校验] 候选种子距离和：{candidate_dist_sum}，最终选择种子局部索引：{seed_idx}，客户端ID：{client_ids[seed_idx]}")
         else:
             # Original logic: select the client with minimum sum_dis
             seed_idx = int(np.argmin(sum_dis))
-        
+
         choice = seed_idx
         logging.info(f"[Scope] Seed local index: {seed_idx}, client ID: {client_ids[seed_idx]}")
         cluster = [choice]
