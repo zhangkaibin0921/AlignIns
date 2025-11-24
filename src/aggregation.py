@@ -389,8 +389,10 @@ class Aggregation():
         major_sign = torch.sign(torch.sum(torch.sign(inter_model_updates), dim=0))
         mpsa_list = []
         topk_dim = max(1, int(inter_model_updates.shape[1] * sparsity))
+        topk_indices_per_client = []
         for i in range(len(inter_model_updates)):
             _, init_indices = torch.topk(torch.abs(inter_model_updates[i]), topk_dim)
+            topk_indices_per_client.append(init_indices)
             mpsa = (
                 torch.sum(
                     torch.sign(inter_model_updates[i][init_indices]) == major_sign[init_indices]
@@ -441,7 +443,8 @@ class Aggregation():
             corrected = vec.clone()
             if idx in suspect_indices:
                 target_sign = torch.where(clean_major_sign == 0, torch.sign(corrected), clean_major_sign)
-                corrected = corrected.abs() * target_sign
+                topk_idx = topk_indices_per_client[idx]
+                corrected[topk_idx] = corrected[topk_idx].abs() * target_sign[topk_idx]
             corrected_updates.append(corrected)
 
         corrected_stack = torch.stack(corrected_updates, dim=0)
@@ -483,7 +486,13 @@ class Aggregation():
         def _distance_stats(indices, centroid):
             if len(indices) == 0:
                 return -np.inf, np.inf, []
-            dists = [torch.norm(normalized_updates[idx] - centroid).item() for idx in indices]
+            centroid_norm = torch.norm(centroid) + eps
+            dists = []
+            for idx in indices:
+                vec = normalized_updates[idx]
+                vec_norm = torch.norm(vec) + eps
+                cosine_distance = 1.0 - torch.dot(vec, centroid) / (vec_norm * centroid_norm)
+                dists.append(cosine_distance.item())
             if len(dists) < 2:
                 return -np.inf, np.inf, dists
             dist_tensor = torch.tensor(dists, dtype=torch.float64)
@@ -497,7 +506,10 @@ class Aggregation():
         lower_dist, upper_dist, benign_dists = _distance_stats(clean_indices, temp_update)
         accepted_suspects = []
         for idx in suspect_indices:
-            dist = torch.norm(normalized_updates[idx] - temp_update).item()
+            vec = normalized_updates[idx]
+            vec_norm = torch.norm(vec) + eps
+            centroid_norm = torch.norm(temp_update) + eps
+            dist = 1.0 - torch.dot(vec, temp_update) / (vec_norm * centroid_norm)
             if lower_dist <= dist <= upper_dist:
                 accepted_suspects.append(idx)
 
