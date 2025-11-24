@@ -548,10 +548,23 @@ class Aggregation():
             try:
                 inv = np.linalg.inv(cov)
             except np.linalg.LinAlgError:
-                inv = np.eye(3)
+                return
             for i in range(n):
                 for j in range(i + 1, n):
                     v = np.array([cosZ[i, j], l1Z[i, j], l2Z[i, j]])
+                    d = float(v.T @ inv @ v)
+                    combined_D[i, j] = combined_D[j, i] = d
+        elif combine_method == "mahalanobis_raw":
+            idx_i, idx_j = np.triu_indices(n, k=1)
+            feats = np.stack([cos_mat[idx_i, idx_j], l1_mat[idx_i, idx_j], l2_mat[idx_i, idx_j]], axis=1)
+            cov = np.cov(feats.T)
+            try:
+                inv = np.linalg.inv(cov)
+            except np.linalg.LinAlgError:
+                return
+            for i in range(n):
+                for j in range(i + 1, n):
+                    v = np.array([cos_mat[i, j], l1_mat[i, j], l2_mat[i, j]])
                     d = float(v.T @ inv @ v)
                     combined_D[i, j] = combined_D[j, i] = d
         elif combine_method == "fedid_dynamic":  # 新增：FedID动态加权策略
