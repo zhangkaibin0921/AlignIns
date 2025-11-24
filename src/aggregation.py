@@ -832,8 +832,11 @@ class Aggregation():
             combined_D = np.sqrt(np.maximum(cosZ, 0.0) ** 2 + np.maximum(l1Z, 0.0) ** 2 + np.maximum(l2Z, 0.0) ** 2)
         elif combine_method == "max":
             combined_D = np.maximum.reduce([cosZ, l1Z, l2Z])
+            logging.info("[Scope][max] raw cos_mat: %s" % np.round(cos_mat, 3).tolist())
             logging.info("[Scope][max] cosZ: %s" % np.round(cosZ, 3).tolist())
+            logging.info("[Scope][max] raw l1_mat: %s" % np.round(l1_mat, 3).tolist())
             logging.info("[Scope][max] l1Z: %s" % np.round(l1Z, 3).tolist())
+            logging.info("[Scope][max] raw l2_mat: %s" % np.round(l2_mat, 3).tolist())
             logging.info("[Scope][max] l2Z: %s" % np.round(l2Z, 3).tolist())
             logging.info("[Scope][max] combined_D: %s" % np.round(combined_D, 3).tolist())
         elif combine_method == "scope":
