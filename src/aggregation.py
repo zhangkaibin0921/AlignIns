@@ -799,7 +799,6 @@ class Aggregation():
                 l1_mat[i, j] = l1_mat[j, i] = manhattan_distance
                 l2_mat[i, j] = l2_mat[j, i] = euclidean_distance
 
-        std_mats = []
         # z-score each metric using upper triangle stats   zscore的方式有负数
 
         # for M in (cos_mat, l1_mat, l2_mat):
@@ -810,6 +809,7 @@ class Aggregation():
         #     Z = (M - mean) / std
         #     std_mats.append(Z)
 
+        std_mats = []
         for M in (cos_mat, l1_mat, l2_mat):
             triu = M[np.triu_indices_from(M, k=1)]  # 取上三角（不含对角线）的距离值（避免对角线0值影响极值计算）
             if triu.size == 0:
@@ -832,10 +832,10 @@ class Aggregation():
             combined_D = np.sqrt(np.maximum(cosZ, 0.0) ** 2 + np.maximum(l1Z, 0.0) ** 2 + np.maximum(l2Z, 0.0) ** 2)
         elif combine_method == "max":
             combined_D = np.maximum.reduce([cosZ, l1Z, l2Z])
-            logging.info("[Scope][max] cosZ: %s" % cosZ.tolist())
-            logging.info("[Scope][max] l1Z: %s" % l1Z.tolist())
-            logging.info("[Scope][max] l2Z: %s" % l2Z.tolist())
-            logging.info("[Scope][max] combined_D: %s" % combined_D.tolist())
+            logging.info("[Scope][max] cosZ: %s" % np.round(cosZ, 3).tolist())
+            logging.info("[Scope][max] l1Z: %s" % np.round(l1Z, 3).tolist())
+            logging.info("[Scope][max] l2Z: %s" % np.round(l2Z, 3).tolist())
+            logging.info("[Scope][max] combined_D: %s" % np.round(combined_D, 3).tolist())
         elif combine_method == "scope":
             # Original scope method: use cosine distance with special handling
             # 注意：循环包含 i == j，显式计算对角线（自己到自己的距离为0）
@@ -851,7 +851,6 @@ class Aggregation():
             #         if abs(cosine_distance) < 0.000001:
             #             cosine_distance = 100.0
             #         combined_D[i, j] = combined_D[j, i] = cosine_distance
-
             combined_D = cosZ
         elif combine_method == "mahalanobis":
             idx_i, idx_j = np.triu_indices(n, k=1)
@@ -893,18 +892,7 @@ class Aggregation():
             # Default: euclidean combination
             combined_D = np.sqrt(np.maximum(cosZ, 0.0) ** 2 + np.maximum(l1Z, 0.0) ** 2 + np.maximum(l2Z, 0.0) ** 2)
 
-        # 处理对角线：scope方法已在循环中显式计算为100.0，其他方法设置为inf避免argmin选择自己
-        # if combine_method != "scope":
-        #     np.fill_diagonal(combined_D, np.inf)
-
-        # Calculate sum_dis using combined_D
-        # 对于非scope方法，计算sum_dis时需要排除对角线（因为对角线是inf）
-        # if combine_method == "scope":
-        #     sum_dis = np.sum(combined_D, axis=1)
-        # else:
-
         np.fill_diagonal(combined_D, np.inf)
-        # sum_dis = np.sum(combined_D, axis=1) - np.diag(combined_D)
         sum_dis = []
         for i in range(n):
             # 只计算当前客户端与其他所有客户端的距离和（排除自己）
