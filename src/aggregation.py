@@ -1077,6 +1077,7 @@ class Aggregation():
             #             cosine_distance = 100.0
             #         combined_D[i, j] = combined_D[j, i] = cosine_distance
             combined_D = cosZ
+            logging.info("[Scope][max] cosZ: %s" % np.round(cosZ, 3).tolist())
         elif combine_method == "mahalanobis":
             idx_i, idx_j = np.triu_indices(n, k=1)
             feats = np.stack([cosZ[idx_i, idx_j], l1Z[idx_i, idx_j], l2Z[idx_i, idx_j]], axis=1)
