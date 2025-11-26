@@ -43,6 +43,8 @@ class Aggregation():
 
         elif self.args.aggr == 'alignins':
             aggregated_updates = self.agg_alignins(agent_updates_dict, cur_global_params)
+        elif self.args.aggr == 'mpsa':
+            aggregated_updates = self.agg_mpsa(agent_updates_dict, cur_global_params)
         elif self.args.aggr == 'mmetric':
             aggregated_updates = self.agg_mul_metric(agent_updates_dict, global_model, cur_global_params)
         elif self.args.aggr == 'scopemm':
@@ -223,6 +225,97 @@ class Aggregation():
         logging.info('TPR:       %.4f' % TPR)
 
         current_dict = {chosen_clients[idx]: benign_updates[idx] for idx in benign_idx}
+        aggregated_update = self.agg_avg(current_dict)
+        return aggregated_update
+
+    def agg_mpsa(self, agent_updates_dict, flat_global_model):
+        """
+        仅保留 AlignIns 中的 MPSA 检测逻辑，去掉 TDA 相关计算以及后续裁剪步骤。
+        """
+        local_updates = []
+        benign_id = []
+        malicious_id = []
+
+        for _id, update in agent_updates_dict.items():
+            local_updates.append(update)
+            if _id < self.args.num_corrupt:
+                malicious_id.append(_id)
+            else:
+                benign_id.append(_id)
+
+        chosen_clients = malicious_id + benign_id
+        num_chosen_clients = len(chosen_clients)
+        inter_model_updates = torch.stack(local_updates, dim=0)
+
+        mpsa_list = []
+        major_sign = torch.sign(torch.sum(torch.sign(inter_model_updates), dim=0))
+        for i in range(len(inter_model_updates)):
+            _, init_indices = torch.topk(
+                torch.abs(inter_model_updates[i]),
+                int(len(inter_model_updates[i]) * self.args.sparsity)
+            )
+            mpsa = (
+                torch.sum(
+                    torch.sign(inter_model_updates[i][init_indices]) == major_sign[init_indices]
+                ) / torch.numel(inter_model_updates[i][init_indices])
+            ).item()
+            mpsa_list.append(mpsa)
+
+        logging.info('MPSA: %s' % [round(i, 4) for i in mpsa_list])
+
+        mpsa_std = np.std(mpsa_list) if len(mpsa_list) > 1 else 1e-12
+        mpsa_med = np.median(mpsa_list)
+        mzscore_mpsa = [np.abs(m - mpsa_med) / mpsa_std for m in mpsa_list]
+        logging.info('MZ-score of MPSA: %s' % [round(i, 4) for i in mzscore_mpsa])
+
+        benign_idx = set(range(num_chosen_clients))
+        benign_idx.intersection_update(
+            set(np.argwhere(np.array(mzscore_mpsa) < self.args.lambda_s).flatten().astype(int))
+        )
+        benign_idx = sorted(list(benign_idx))
+        if len(benign_idx) == 0:
+            return torch.zeros_like(local_updates[0])
+
+        def _calc_precision(selected_indices, chosen_ids, actual_benign_ids):
+            selected_count = len(selected_indices)
+            if selected_count == 0:
+                return None, selected_count, 0
+            true_clean_count = 0
+            for idx in selected_indices:
+                actual_id = chosen_ids[idx]
+                if actual_id in actual_benign_ids:
+                    true_clean_count += 1
+            precision = true_clean_count / selected_count
+            return precision, selected_count, true_clean_count
+
+        mpsa_precision, mpsa_selected, mpsa_true_clean = _calc_precision(benign_idx, chosen_clients, benign_id)
+        if mpsa_precision is not None:
+            logging.info(
+                f"[MPSA-Only] 识别的干净客户端准确率(Precision): {mpsa_precision:.4f}  |  选中数: {mpsa_selected}  真正干净数: {mpsa_true_clean}"
+            )
+        else:
+            logging.info(f"[MPSA-Only] 无选中客户端，无法计算干净客户端准确率")
+
+        correct = 0
+        for idx in benign_idx:
+            if chosen_clients[idx] in benign_id:
+                correct += 1
+        TPR = correct / len(benign_id) if len(benign_id) > 0 else 0.0
+
+        FPR = 0.0
+        if len(malicious_id) > 0:
+            wrong = 0
+            for idx in benign_idx:
+                if chosen_clients[idx] in malicious_id:
+                    wrong += 1
+            FPR = wrong / len(malicious_id)
+
+        logging.info('benign update index:   %s' % str(benign_id))
+        logging.info('selected update index: %s' % str(benign_idx))
+        logging.info('FPR:       %.4f' % FPR)
+        logging.info('TPR:       %.4f' % TPR)
+
+        current_dict = {chosen_clients[idx]: local_updates[idx] for idx in benign_idx}
         aggregated_update = self.agg_avg(current_dict)
         return aggregated_update
 

@@ -123,7 +123,8 @@ if __name__ == "__main__":
             "rfa",
             "scopemm",
             "scope",
-            "mpsaguard"
+            "mpsaguard",
+            "mpsa"
         ],
         help="aggregation function to aggregate agents' local weights",
     )
