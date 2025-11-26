@@ -1082,8 +1082,11 @@ class Aggregation():
         """
         # Get parameters
         eps = getattr(self.args, "eps", 1e-12)
+        sparsity = getattr(self.args, "sparsity", 0.3)
+        lambda_s = getattr(self.args, "lambda_s", 1.0)
         combine_method = getattr(self.args, "combine_method", "scope")  # Default to "scope" for backward compatibility
         self.fedid_reg = float(getattr(self.args, "fedid_reg", 1e-3))
+        use_mpsa_prefilter = getattr(self.args, "use_mpsa_prefilter", False)
 
         client_ids = []
         local_updates = []
@@ -1232,12 +1235,65 @@ class Aggregation():
             combined_D = np.sqrt(np.maximum(cosZ, 0.0) ** 2 + np.maximum(l1Z, 0.0) ** 2 + np.maximum(l2Z, 0.0) ** 2)
 
         np.fill_diagonal(combined_D, np.inf)
-        sum_dis = []
-        for i in range(n):
-            # 只计算当前客户端与其他所有客户端的距离和（排除自己）
-            other_distances = combined_D[i, np.arange(n) != i]
-            sum_dis.append(np.sum(other_distances))
-        sum_dis = np.array(sum_dis)
+
+        if use_mpsa_prefilter:
+            inter_model_updates = torch.stack(local_updates, dim=0)
+            major_sign = torch.sign(torch.sum(torch.sign(inter_model_updates), dim=0))
+            topk_dim = max(1, int(inter_model_updates.shape[1] * float(sparsity)))
+            mpsa_list = []
+            for i in range(inter_model_updates.shape[0]):
+                vec_i = inter_model_updates[i]
+                abs_i = torch.abs(vec_i)
+                _, init_indices = torch.topk(abs_i, topk_dim)
+                agree = torch.sum(torch.sign(vec_i[init_indices]) == major_sign[init_indices]).item()
+                mpsa = agree / float(init_indices.numel())
+                mpsa_list.append(mpsa)
+            mpsa_arr = np.array(mpsa_list, dtype=np.float64)
+            mpsa_std = np.std(mpsa_arr)
+            mpsa_med = np.median(mpsa_arr)
+            mpsa_std = mpsa_std if mpsa_std > eps else 1.0
+            mzscore_mpsa = np.abs(mpsa_arr - mpsa_med) / mpsa_std
+            allowed_indices = [int(i) for i in np.where(mzscore_mpsa < float(lambda_s))[0]]
+            if len(allowed_indices) == 0:
+                logging.info("[Scope] MPSA 未筛出良性客户端，退化为使用全部客户端")
+                allowed_indices = list(range(n))
+        else:
+            allowed_indices = list(range(n))
+            logging.info("[Scope] 已关闭 MPSA 预筛选，使用全部客户端")
+
+        allowed_indices = sorted(allowed_indices)
+
+        def _calc_precision(selected_indices, id_list, actual_benign_ids):
+            selected_count = len(selected_indices)
+            if selected_count == 0:
+                return None, selected_count, 0
+            true_clean_count = 0
+            for idx in selected_indices:
+                actual_id = id_list[idx]
+                if actual_id in actual_benign_ids:
+                    true_clean_count += 1
+            precision = true_clean_count / selected_count
+            return precision, selected_count, true_clean_count
+
+        mpsa_precision, mpsa_selected, mpsa_true_clean = _calc_precision(allowed_indices, client_ids, benign_id)
+        if mpsa_precision is not None:
+            logging.info(
+                f"[Scope][MPSA] 识别的干净客户端准确率(Precision): {mpsa_precision:.4f}  |  选中数: {mpsa_selected}  真正干净数: {mpsa_true_clean}"
+            )
+        else:
+            logging.info(f"[Scope][MPSA] 无选中客户端，无法计算干净客户端准确率")
+
+        allowed_arr = np.array(allowed_indices, dtype=int)
+        if allowed_arr.size == 0:
+            return torch.zeros_like(local_updates[0])
+
+        allowed_sum_dis = np.zeros(len(allowed_arr))
+        for idx, local_idx in enumerate(allowed_arr):
+            mask = allowed_arr != local_idx
+            if mask.any():
+                allowed_sum_dis[idx] = np.sum(combined_D[local_idx, allowed_arr[mask]])
+            else:
+                allowed_sum_dis[idx] = 0.0
 
         # Candidate seed selection logic (similar to agg_scope_multimetric)
         use_candidate_seed = getattr(self.args, "use_candidate_seed", False)
@@ -1246,17 +1302,15 @@ class Aggregation():
         logging.info(f"[Scope] Using combine_method: {combine_method}")
 
         if use_candidate_seed:
-            # Select candidate seeds from all clients based on sum_dis
-            num_candidates = max(1, int(n * candidate_seed_ratio))
-            sorted_candidate_indices = np.argsort(sum_dis)[:num_candidates]
-            candidate_seeds = sorted_candidate_indices.tolist()
+            num_candidates = max(1, int(len(allowed_arr) * candidate_seed_ratio))
+            sorted_candidate_positions = np.argsort(allowed_sum_dis)[:num_candidates]
+            candidate_seeds = allowed_arr[sorted_candidate_positions].tolist()
             logging.info(
                 f"[Scope][种子选择] 候选种子比例：{candidate_seed_ratio}，候选种子局部索引：{candidate_seeds}，候选种子客户端ID：{[client_ids[i] for i in candidate_seeds]}，共{len(candidate_seeds)}个")
 
             if len(candidate_seeds) == 1:
                 seed_idx = candidate_seeds[0]
             else:
-                # Calculate distance sum for each candidate seed with other candidates
                 candidate_dist_sum = []
                 for seed in candidate_seeds:
                     other_candidates = [s for s in candidate_seeds if s != seed]
@@ -1270,15 +1324,18 @@ class Aggregation():
                 logging.info(
                     f"[Scope][种子校验] 候选种子距离和：{candidate_dist_sum}，最终选择种子局部索引：{seed_idx}，客户端ID：{client_ids[seed_idx]}")
         else:
-            # Original logic: select the client with minimum sum_dis
-            seed_idx = int(np.argmin(sum_dis))
+            seed_idx = allowed_arr[int(np.argmin(allowed_sum_dis))]
 
         choice = seed_idx
         logging.info(f"[Scope] Seed local index: {seed_idx}, client ID: {client_ids[seed_idx]}")
         cluster = [choice]
         round_idx = 1
-        for _ in range(n):
-            tmp = int(np.argmin(combined_D[choice]))
+        for _ in range(len(allowed_arr)):
+            remaining = [idx for idx in allowed_arr if idx not in cluster]
+            if not remaining:
+                break
+            dist_row = combined_D[choice, remaining]
+            tmp = remaining[int(np.argmin(dist_row))]
             if tmp not in cluster:
                 cluster.append(tmp)
                 logging.info(f"[Scope][Round {round_idx}] Added client ID: {client_ids[tmp]} (local idx: {tmp})")
