@@ -147,9 +147,12 @@ if __name__ == "__main__":
     parser.add_argument("--percent_select", type=float, default=20.0, help="percentage of clients to select per wave expansion round in ScopeMM")
     parser.add_argument("--combine_method", type=str, default="max", choices=["max", "euclidean", "mahalanobis", "fedid_dynamic", "scope"], help="method to combine multiple metrics in ScopeMM")
     parser.add_argument("--use_candidate_seed", action="store_true", default=False, help="use candidate seed selection in ScopeMM wave expansion")
-    parser.add_argument("--use_mpsa_prefilter", action="store_true", default=False, help="use MPSA prefilter in ScopeMM")
+    parser.add_argument("--use_mpsa_prefilter", action="store_true", default=False, help="use MPSA prefilter in ScopeMM/Scope")
     parser.add_argument("--candidate_seed_ratio", type=float, default=0.5, help="ratio of candidates for seed selection in ScopeMM")
     parser.add_argument("--fedid_reg", type=float, default=1e-3, help="regularization coefficient for FedID dynamic weighting in ScopeMM")
+    parser.add_argument("--use_norm_prefilter", action="store_true", default=False, help="enable norm-based prefilter before MPSA in Scope aggregation")
+    parser.add_argument("--norm_prefilter_lower", type=float, default=0.1, help="lower multiplier (relative to median norm) for Scope norm prefilter")
+    parser.add_argument("--norm_prefilter_upper", type=float, default=3.0, help="upper multiplier (relative to median norm) for Scope norm prefilter")
 
     args = parser.parse_args()
 

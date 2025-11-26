@@ -1087,6 +1087,9 @@ class Aggregation():
         combine_method = getattr(self.args, "combine_method", "scope")  # Default to "scope" for backward compatibility
         self.fedid_reg = float(getattr(self.args, "fedid_reg", 1e-3))
         use_mpsa_prefilter = getattr(self.args, "use_mpsa_prefilter", False)
+        use_norm_prefilter = getattr(self.args, "use_norm_prefilter", False)
+        norm_lower = float(getattr(self.args, "norm_prefilter_lower", 0.1))
+        norm_upper = float(getattr(self.args, "norm_prefilter_upper", 3.0))
 
         client_ids = []
         local_updates = []
@@ -1110,6 +1113,8 @@ class Aggregation():
             return torch.zeros_like(flat_global_model)
         if n == 1:
             return local_updates[0]
+
+        inter_model_updates = torch.stack(local_updates, dim=0)
 
         # Compute relative change pre-metric
         pre_metric_dis = []
@@ -1236,13 +1241,43 @@ class Aggregation():
 
         np.fill_diagonal(combined_D, np.inf)
 
+        allowed_set = set(range(n))
+        if use_norm_prefilter:
+            grad_l2 = torch.norm(inter_model_updates, dim=1).cpu().numpy()
+            grad_l1 = torch.norm(inter_model_updates, p=1, dim=1).cpu().numpy()
+
+            def _apply_range_filter(values, lower_scale, upper_scale, tag):
+                nonlocal allowed_set
+                if values.size == 0:
+                    return
+                median_val = np.median(values)
+                base = max(median_val, eps)
+                lower = lower_scale * base
+                upper = upper_scale * base
+                filtered_idx = set(np.argwhere((values > lower) & (values < upper)).flatten().astype(int))
+                removed_idx = sorted(list(allowed_set - filtered_idx))
+                allowed_set = allowed_set.intersection(filtered_idx)
+                logging.info(
+                    f"[Scope][NormFilter][{tag}] median={median_val:.4e}, range=({lower:.4e}, {upper:.4e}), keep={len(allowed_set)} / {n}, removed={removed_idx}"
+                )
+
+            _apply_range_filter(grad_l2, norm_lower, norm_upper, "L2")
+            _apply_range_filter(grad_l1, norm_lower, norm_upper, "L1")
+
+            if len(allowed_set) == 0:
+                logging.info("[Scope][NormFilter] 无满足范数阈值的客户端，退化为使用全部客户端")
+                allowed_set = set(range(n))
+        else:
+            logging.info("[Scope] 已关闭范数预筛选，默认使用全部客户端")
+
         if use_mpsa_prefilter:
-            inter_model_updates = torch.stack(local_updates, dim=0)
-            major_sign = torch.sign(torch.sum(torch.sign(inter_model_updates), dim=0))
-            topk_dim = max(1, int(inter_model_updates.shape[1] * float(sparsity)))
+            allowed_sorted = sorted(list(allowed_set))
+            subset_updates = inter_model_updates[allowed_sorted]
+            major_sign = torch.sign(torch.sum(torch.sign(subset_updates), dim=0))
+            topk_dim = max(1, int(subset_updates.shape[1] * float(sparsity)))
             mpsa_list = []
-            for i in range(inter_model_updates.shape[0]):
-                vec_i = inter_model_updates[i]
+            for i in range(subset_updates.shape[0]):
+                vec_i = subset_updates[i]
                 abs_i = torch.abs(vec_i)
                 _, init_indices = torch.topk(abs_i, topk_dim)
                 agree = torch.sum(torch.sign(vec_i[init_indices]) == major_sign[init_indices]).item()
@@ -1253,15 +1288,22 @@ class Aggregation():
             mpsa_med = np.median(mpsa_arr)
             mpsa_std = mpsa_std if mpsa_std > eps else 1.0
             mzscore_mpsa = np.abs(mpsa_arr - mpsa_med) / mpsa_std
-            allowed_indices = [int(i) for i in np.where(mzscore_mpsa < float(lambda_s))[0]]
-            if len(allowed_indices) == 0:
+            allowed_indices_local = np.where(mzscore_mpsa < float(lambda_s))[0]
+            mpsa_allowed = set(allowed_sorted[int(i)] for i in allowed_indices_local)
+            if len(mpsa_allowed) == 0:
                 logging.info("[Scope] MPSA 未筛出良性客户端，退化为使用全部客户端")
-                allowed_indices = list(range(n))
+                allowed_set = set(range(n))
+            else:
+                allowed_set = allowed_set.intersection(mpsa_allowed)
+                if len(allowed_set) == 0:
+                    logging.info("[Scope] 范数+MPSA 交集为空，退化为使用 MPSA 允许集合")
+                    allowed_set = mpsa_allowed
         else:
-            allowed_indices = list(range(n))
-            logging.info("[Scope] 已关闭 MPSA 预筛选，使用全部客户端")
+            logging.info("[Scope] 已关闭 MPSA 预筛选")
 
-        allowed_indices = sorted(allowed_indices)
+        allowed_indices = sorted(list(allowed_set))
+        if len(allowed_indices) == 0:
+            return torch.zeros_like(local_updates[0])
 
         def _calc_precision(selected_indices, id_list, actual_benign_ids):
             selected_count = len(selected_indices)
@@ -1275,18 +1317,15 @@ class Aggregation():
             precision = true_clean_count / selected_count
             return precision, selected_count, true_clean_count
 
-        mpsa_precision, mpsa_selected, mpsa_true_clean = _calc_precision(allowed_indices, client_ids, benign_id)
-        if mpsa_precision is not None:
+        filter_precision, filter_selected, filter_true_clean = _calc_precision(allowed_indices, client_ids, benign_id)
+        if filter_precision is not None:
             logging.info(
-                f"[Scope][MPSA] 识别的干净客户端准确率(Precision): {mpsa_precision:.4f}  |  选中数: {mpsa_selected}  真正干净数: {mpsa_true_clean}"
+                f"[Scope][Filter] 识别的干净客户端准确率(Precision): {filter_precision:.4f}  |  选中数: {filter_selected}  真正干净数: {filter_true_clean}"
             )
         else:
-            logging.info(f"[Scope][MPSA] 无选中客户端，无法计算干净客户端准确率")
+            logging.info(f"[Scope][Filter] 无选中客户端，无法计算干净客户端准确率")
 
         allowed_arr = np.array(allowed_indices, dtype=int)
-        if allowed_arr.size == 0:
-            return torch.zeros_like(local_updates[0])
-
         allowed_sum_dis = np.zeros(len(allowed_arr))
         for idx, local_idx in enumerate(allowed_arr):
             mask = allowed_arr != local_idx
