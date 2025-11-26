@@ -814,13 +814,29 @@ class Aggregation():
                 l2_mat[i, j] = l2_mat[j, i] = euclidean_distance
 
         # z-score each metric using upper triangle stats
+        # std_mats = []
+        # for M in (cos_mat, l1_mat, l2_mat):
+        #     triu = M[np.triu_indices_from(M, k=1)]
+        #     mean = np.mean(triu) if triu.size > 0 else 0.0
+        #     std = np.std(triu) if triu.size > 0 else 1.0
+        #     std = std if std > eps else 1.0
+        #     Z = (M - mean) / std
+        #     std_mats.append(Z)
+        # cosZ, l1Z, l2Z = std_mats
+
         std_mats = []
         for M in (cos_mat, l1_mat, l2_mat):
-            triu = M[np.triu_indices_from(M, k=1)]
-            mean = np.mean(triu) if triu.size > 0 else 0.0
-            std = np.std(triu) if triu.size > 0 else 1.0
-            std = std if std > eps else 1.0
-            Z = (M - mean) / std
+            triu = M[np.triu_indices_from(M, k=1)]  # 取上三角（不含对角线）的距离值（避免对角线0值影响极值计算）
+            if triu.size == 0:
+                # 无有效距离值（仅1个客户端，实际前面已处理n=1的情况），直接返回全0矩阵
+                Z = np.zeros_like(M)
+            else:
+                min_val = np.min(triu)
+                max_val = np.max(triu)
+                # 避免分母为0（所有距离相同），添加eps保护
+                denominator = max_val - min_val + eps
+                # Min-Max 公式：Z = (M - min_val) / denominator，缩放到 [0, 1]
+                Z = (M - min_val) / denominator
             std_mats.append(Z)
         cosZ, l1Z, l2Z = std_mats
 
@@ -831,18 +847,22 @@ class Aggregation():
         elif combine_method == "max":
             combined_D = np.maximum.reduce([cosZ, l1Z, l2Z])
         elif combine_method == "scope":
-            for i in range(n):
-                gi = pre_metric_dis[i]
-                ni = np.linalg.norm(gi)
-                ni = ni if ni > eps else eps
-                for j in range(i + 1, n):
-                    gj = pre_metric_dis[j]
-                    nj = np.linalg.norm(gj)
-                    nj = nj if nj > eps else eps
-                    cosine_distance = float(1.0 - (np.dot(gi, gj) / (ni * nj)))
-                    if abs(cosine_distance) < 0.000001:
-                        cosine_distance = 100.0
-                    combined_D[i, j] = combined_D[j, i] = cosine_distance
+            # Original scope method: use cosine distance with special handling
+            # 注意：循环包含 i == j，显式计算对角线（自己到自己的距离为0）
+            # for i in range(n):
+            #     gi = pre_metric_dis[i]
+            #     ni = np.linalg.norm(gi)
+            #     ni = ni if ni > eps else eps
+            #     for j in range(i, n):  # 包含 i == j，与原始实现一致
+            #         gj = pre_metric_dis[j]
+            #         nj = np.linalg.norm(gj)
+            #         nj = nj if nj > eps else eps
+            #         cosine_distance = float(1.0 - (np.dot(gi, gj) / (ni * nj)))
+            #         if abs(cosine_distance) < 0.000001:
+            #             cosine_distance = 100.0
+            #         combined_D[i, j] = combined_D[j, i] = cosine_distance
+            combined_D = cosZ
+            logging.info("[Scope][max] cosZ: %s" % np.round(cosZ, 3).tolist())
         elif combine_method == "mahalanobis":
             idx_i, idx_j = np.triu_indices(n, k=1)
             feats = np.stack([cosZ[idx_i, idx_j], l1Z[idx_i, idx_j], l2Z[idx_i, idx_j]], axis=1)
