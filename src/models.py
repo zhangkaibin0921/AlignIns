@@ -9,8 +9,8 @@ import logging
 
 def get_model(data, args):
     if data == 'cifar10':
-        # model = ResNet9(3,num_classes=10, args=args)
-        model = VGG('VGG9', num_classes=10)
+        model = ResNet9(3,num_classes=10, args=args)
+        # model = VGG('VGG9', num_classes=10)
         # Load pretrained weights if specified
         if hasattr(args, 'pretrained_path') and args.pretrained_path is not None and os.path.exists(args.pretrained_path):
             logging.info(f"Loading pretrained ResNet9 model from: {args.pretrained_path}")
