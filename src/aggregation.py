@@ -1331,11 +1331,8 @@ class Aggregation():
         cluster = [choice]
         round_idx = 1
         for _ in range(len(allowed_arr)):
-            remaining = [idx for idx in allowed_arr if idx not in cluster]
-            if not remaining:
-                break
-            dist_row = combined_D[choice, remaining]
-            tmp = remaining[int(np.argmin(dist_row))]
+            dist_row = combined_D[choice, allowed_arr]
+            tmp = allowed_arr[int(np.argmin(dist_row))]
             if tmp not in cluster:
                 cluster.append(tmp)
                 logging.info(f"[Scope][Round {round_idx}] Added client ID: {client_ids[tmp]} (local idx: {tmp})")
