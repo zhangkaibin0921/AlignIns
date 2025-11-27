@@ -130,6 +130,13 @@ if __name__ == "__main__":
         ],
         help="aggregation function to aggregate agents' local weights",
     )
+    parser.add_argument("--align_cluster_method", type=str, default="none", choices=["none", "kmeans", "spectral", "dbscan", "hdbscan"], help="clustering method for avg_align diagnostics")
+    parser.add_argument("--align_cluster_k", type=int, default=2, help="number of clusters to use when align_cluster_method is kmeans")
+    parser.add_argument("--align_spectral_clusters", type=int, default=2, help="number of clusters for spectral clustering in avg_align")
+    parser.add_argument("--align_dbscan_eps", type=float, default=0.3, help="DBSCAN epsilon for avg_align clustering")
+    parser.add_argument("--align_dbscan_min_samples", type=int, default=2, help="DBSCAN min_samples for avg_align clustering")
+    parser.add_argument("--align_hdbscan_min_cluster_size", type=int, default=2, help="HDBSCAN min_cluster_size for avg_align clustering")
+    parser.add_argument("--align_hdbscan_min_samples", type=int, default=1, help="HDBSCAN min_samples for avg_align clustering")
     parser.add_argument("--lr_decay", type=float, default=0.99)
     parser.add_argument("--momentum", type=float, default=0.0)
     parser.add_argument("--mask_init", type=str, default="ERK")

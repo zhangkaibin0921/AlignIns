@@ -7,7 +7,17 @@ import logging
 from utils import vector_to_model, vector_to_name_param
 
 import sklearn.metrics.pairwise as smp
-from geom_median.torch import compute_geometric_median 
+from geom_median.torch import compute_geometric_median
+
+try:
+    from sklearn.cluster import KMeans, SpectralClustering, DBSCAN
+except ImportError:  # pragma: no cover
+    KMeans = SpectralClustering = DBSCAN = None
+
+try:
+    import hdbscan
+except ImportError:  # pragma: no cover
+    hdbscan = None
 
 
 class Aggregation():
@@ -334,14 +344,12 @@ class Aggregation():
 
     def agg_avg_alignment(self, agent_updates_dict):
         """
-        FedAvg-style aggregation without filtering, plus pairwise sign-alignment diagnostics.
-        Computes coordinate-wise signs over the intersection of top 30%% important gradients.
+        FedAvg-style aggregation with sign-alignment diagnostics.
+        When clustering is enabled, the largest cluster is treated as the benign set
+        and only those client updates are aggregated.
         """
         if len(agent_updates_dict) == 0:
             raise ValueError("agent_updates_dict must not be empty for avg_align aggregation")
-
-        # Reuse FedAvg result for aggregation output
-        aggregated_update = self.agg_avg(agent_updates_dict)
 
         client_ids = list(agent_updates_dict.keys())
         local_updates = [agent_updates_dict[cid] for cid in client_ids]
@@ -403,6 +411,119 @@ class Aggregation():
         _log_stats("Benign-Benign", benign_pairs)
         _log_stats("Benign-Malicious", mixed_pairs)
         _log_stats("Malicious-Malicious", malicious_pairs)
+
+        cluster_method = getattr(self.args, "align_cluster_method", "none").lower()
+        selected_indices = list(range(n_clients))
+
+        def _report_clusters(labels, method_name):
+            unique_labels = sorted(set(labels))
+            stats = []
+            for cluster_id in unique_labels:
+                member_idx = np.where(labels == cluster_id)[0]
+                if len(member_idx) == 0:
+                    continue
+                member_ids = [client_ids[idx] for idx in member_idx]
+                benign_cnt = sum(1 for cid in member_ids if cid >= num_corrupt)
+                malicious_cnt = len(member_ids) - benign_cnt
+                majority_type = "Benign" if benign_cnt >= malicious_cnt else "Malicious"
+                logging.info(
+                    f"[AvgAlign][{method_name}][cluster={cluster_id}] size={len(member_ids)} ({majority_type}), "
+                    f"benign={benign_cnt}, malicious={malicious_cnt}, members={member_ids}"
+                )
+                if len(member_idx) >= 2:
+                    sub_matrix = align_matrix[np.ix_(member_idx, member_idx)]
+                    tril = np.tril_indices_from(sub_matrix, k=-1)
+                    if len(tril[0]) > 0:
+                        vals = sub_matrix[tril]
+                        logging.info(
+                            f"[AvgAlign][{method_name}][cluster={cluster_id}] pairwise align mean={vals.mean():.4f}, "
+                            f"std={vals.std():.4f}, min={vals.min():.4f}, max={vals.max():.4f}"
+                        )
+                stats.append((cluster_id, len(member_idx), majority_type, member_idx))
+            return stats
+
+        cluster_labels = None
+        cluster_stats = []
+        if cluster_method != "none":
+            if n_clients < 2:
+                logging.info("[AvgAlign][Cluster] 客户端数量不足，跳过聚类（n_clients=%d）", n_clients)
+            else:
+                if cluster_method == "kmeans":
+                    if KMeans is None:  # pragma: no cover
+                        logging.warning("[AvgAlign][KMeans] sklearn 未安装，无法执行 KMeans 聚类")
+                    else:
+                        cluster_k = int(getattr(self.args, "align_cluster_k", 2))
+                        cluster_k = max(1, min(cluster_k, n_clients))
+                        if cluster_k == 1:
+                            logging.info("[AvgAlign][KMeans] 聚类数为1，所有客户端视为同一簇")
+                            cluster_labels = np.zeros(n_clients, dtype=int)
+                        else:
+                            features = align_matrix
+                            try:
+                                kmeans = KMeans(n_clusters=cluster_k, n_init="auto", random_state=42)
+                            except TypeError:
+                                kmeans = KMeans(n_clusters=cluster_k, n_init=10, random_state=42)
+                            cluster_labels = kmeans.fit_predict(features)
+                elif cluster_method == "spectral":
+                    if SpectralClustering is None:  # pragma: no cover
+                        logging.warning("[AvgAlign][Spectral] sklearn 未安装，无法执行谱聚类")
+                    else:
+                        cluster_k = int(getattr(self.args, "align_spectral_clusters", 2))
+                        cluster_k = max(2, min(cluster_k, n_clients))
+                        spectral = SpectralClustering(
+                            n_clusters=cluster_k, affinity="precomputed", assign_labels="kmeans", random_state=42
+                        )
+                        cluster_labels = spectral.fit_predict(align_matrix)
+                elif cluster_method == "dbscan":
+                    if DBSCAN is None:  # pragma: no cover
+                        logging.warning("[AvgAlign][DBSCAN] sklearn 未安装，无法执行 DBSCAN 聚类")
+                    else:
+                        eps = float(getattr(self.args, "align_dbscan_eps", 0.3))
+                        min_samples = int(getattr(self.args, "align_dbscan_min_samples", 2))
+                        dist_matrix = 1.0 - align_matrix
+                        dbscan = DBSCAN(eps=eps, min_samples=min_samples, metric="precomputed")
+                        cluster_labels = dbscan.fit_predict(dist_matrix)
+                elif cluster_method == "hdbscan":
+                    if hdbscan is None:  # pragma: no cover
+                        logging.warning("[AvgAlign][HDBSCAN] hdbscan 未安装，无法执行 HDBSCAN 聚类")
+                    else:
+                        dist_matrix = 1.0 - align_matrix
+                        clusterer = hdbscan.HDBSCAN(
+                            metric="precomputed",
+                            min_cluster_size=max(2, n_clients // 2 + 1),
+                            min_samples=1,
+                            allow_single_cluster=True,
+                        )
+                        cluster_labels = clusterer.fit(dist_matrix).labels_
+                else:
+                    logging.warning(f"[AvgAlign][Cluster] 未知聚类方法: {cluster_method}")
+
+        if cluster_labels is not None:
+            cluster_stats = _report_clusters(cluster_labels, cluster_method.upper())
+            if cluster_stats:
+                valid_stats = [stat for stat in cluster_stats if stat[0] != -1]
+                if not valid_stats:
+                    valid_stats = cluster_stats
+                largest_cluster = max(valid_stats, key=lambda x: x[1])
+                selected_indices = largest_cluster[3].tolist()
+                logging.info(
+                    f"[AvgAlign][Cluster] 选用 cluster={largest_cluster[0]} 进行聚合，成员数={largest_cluster[1]}"
+                )
+            else:
+                logging.info("[AvgAlign][Cluster] 未获得有效聚类结果，退化为使用全部客户端")
+
+        selected_client_ids = [client_ids[idx] for idx in selected_indices]
+        selected_updates = {cid: agent_updates_dict[cid] for cid in selected_client_ids}
+
+        sm_updates, total_data = 0, 0
+        for cid, update in selected_updates.items():
+            data_sz = self.agent_data_sizes[cid]
+            sm_updates += data_sz * update
+            total_data += data_sz
+        if total_data == 0:
+            aggregated_update = torch.mean(torch.stack(list(selected_updates.values()), dim=0), dim=0)
+        else:
+            aggregated_update = sm_updates / total_data
 
         return aggregated_update
 
