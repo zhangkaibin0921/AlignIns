@@ -40,7 +40,8 @@ class Aggregation():
             [global_model.state_dict()[name] for name in global_model.state_dict()]).detach()
         if self.args.aggr=='avg' or self.args.aggr == 'rlr' or self.args.aggr == 'lockdown':          
             aggregated_updates = self.agg_avg(agent_updates_dict)
-
+        elif self.args.aggr == 'median':
+            aggregated_updates = self.agg_median(agent_updates_dict)
         elif self.args.aggr == 'alignins':
             aggregated_updates = self.agg_alignins(agent_updates_dict, cur_global_params)
         elif self.args.aggr == 'mpsa':
@@ -328,6 +329,14 @@ class Aggregation():
             sm_updates +=  n_agent_data * update
             total_data += n_agent_data
         return  sm_updates / total_data
+
+    def agg_median(self, agent_updates_dict):
+        """Coordinate-wise median aggregation."""
+        if len(agent_updates_dict) == 0:
+            raise ValueError("agent_updates_dict must not be empty for median aggregation")
+        stacked = torch.stack(list(agent_updates_dict.values()), dim=0)
+        aggregated_update = torch.median(stacked, dim=0).values
+        return aggregated_update
 
     
     def agg_mkrum(self, agent_updates_dict):
