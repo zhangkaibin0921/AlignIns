@@ -1247,13 +1247,26 @@ class Aggregation():
             grad_l1 = torch.norm(inter_model_updates, p=1, dim=1).cpu().numpy()
 
             def _apply_range_filter(values, lower_scale, upper_scale, tag):
-                nonlocal allowed_set
+                nonlocal allowed_set, client_ids
                 if values.size == 0:
                     return
                 median_val = np.median(values)
                 base = max(median_val, eps)
                 lower = lower_scale * base
                 upper = upper_scale * base
+                
+                # 创建 (范数值, 客户端ID) 配对并排序
+                norm_client_pairs = [(values[i], client_ids[i]) for i in range(len(values))]
+                norm_client_pairs_sorted = sorted(norm_client_pairs, key=lambda x: x[0])
+                sorted_norms = [f"{val:.4e}" for val, _ in norm_client_pairs_sorted]
+                sorted_client_ids = [cid for _, cid in norm_client_pairs_sorted]
+                logging.info(
+                    f"[Scope][NormFilter][{tag}] 范数值排序(从小到大): {sorted_norms}"
+                )
+                logging.info(
+                    f"[Scope][NormFilter][{tag}] 对应客户端ID: {sorted_client_ids}"
+                )
+                
                 filtered_idx = set(np.argwhere((values > lower) & (values < upper)).flatten().astype(int))
                 removed_idx = sorted(list(allowed_set - filtered_idx))
                 allowed_set = allowed_set.intersection(filtered_idx)

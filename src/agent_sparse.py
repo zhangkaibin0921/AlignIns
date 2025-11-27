@@ -82,7 +82,7 @@ class Agent():
                 sort_temp, idx = torch.sort(temp.view(-1), descending=True)
                 masks[name].view(-1)[idx[:num_remove[name]]] = 1
         return masks
-    
+
     # def init_mask(self,  gradient=None):
     #     for name in self.mask:
     #         num_init = torch.count_nonzero(self.mask[name])
