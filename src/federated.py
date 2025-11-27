@@ -115,6 +115,7 @@ if __name__ == "__main__":
         choices=[
             "avg",
             "median",
+            "avg_align",
             "alignins",
             "rlr",
             "mkrum",

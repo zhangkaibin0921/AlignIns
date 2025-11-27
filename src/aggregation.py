@@ -42,6 +42,8 @@ class Aggregation():
             aggregated_updates = self.agg_avg(agent_updates_dict)
         elif self.args.aggr == 'median':
             aggregated_updates = self.agg_median(agent_updates_dict)
+        elif self.args.aggr == 'avg_align':
+            aggregated_updates = self.agg_avg_alignment(agent_updates_dict)
         elif self.args.aggr == 'alignins':
             aggregated_updates = self.agg_alignins(agent_updates_dict, cur_global_params)
         elif self.args.aggr == 'mpsa':
@@ -329,6 +331,80 @@ class Aggregation():
             sm_updates +=  n_agent_data * update
             total_data += n_agent_data
         return  sm_updates / total_data
+
+    def agg_avg_alignment(self, agent_updates_dict):
+        """
+        FedAvg-style aggregation without filtering, plus pairwise sign-alignment diagnostics.
+        Computes coordinate-wise signs over the intersection of top 30%% important gradients.
+        """
+        if len(agent_updates_dict) == 0:
+            raise ValueError("agent_updates_dict must not be empty for avg_align aggregation")
+
+        # Reuse FedAvg result for aggregation output
+        aggregated_update = self.agg_avg(agent_updates_dict)
+
+        client_ids = list(agent_updates_dict.keys())
+        local_updates = [agent_updates_dict[cid] for cid in client_ids]
+        stacked = torch.stack(local_updates, dim=0)
+        n_clients, dim = stacked.shape
+
+        topk_ratio = 0.3
+        topk_dim = max(1, int(dim * topk_ratio))
+        abs_updates = torch.abs(stacked)
+        topk_indices = torch.topk(abs_updates, k=topk_dim, dim=1).indices
+        topk_mask = torch.zeros_like(stacked, dtype=torch.bool)
+        topk_mask.scatter_(1, topk_indices, True)
+
+        sign_updates = torch.sign(stacked)
+        align_matrix = np.zeros((n_clients, n_clients), dtype=np.float64)
+
+        benign_pairs = []
+        mixed_pairs = []
+        malicious_pairs = []
+        num_corrupt = int(getattr(self.args, "num_corrupt", 0))
+
+        for i in range(n_clients):
+            for j in range(i, n_clients):
+                if i == j:
+                    align_matrix[i, j] = 1.0
+                    continue
+
+                common_mask = topk_mask[i] & topk_mask[j]
+                intersect_count = int(common_mask.sum().item())
+                if intersect_count == 0:
+                    align_score = 0.0
+                else:
+                    same_sign = torch.sum(sign_updates[i][common_mask] == sign_updates[j][common_mask]).item()
+                    align_score = same_sign / intersect_count
+
+                align_matrix[i, j] = align_matrix[j, i] = align_score
+
+                id_i = client_ids[i]
+                id_j = client_ids[j]
+                if id_i >= num_corrupt and id_j >= num_corrupt:
+                    benign_pairs.append(align_score)
+                elif id_i < num_corrupt and id_j < num_corrupt:
+                    malicious_pairs.append(align_score)
+                else:
+                    mixed_pairs.append(align_score)
+
+        logging.info("[AvgAlign] Pairwise sign-alignment matrix: %s", np.round(align_matrix, 3).tolist())
+
+        def _log_stats(tag, values):
+            if len(values) == 0:
+                logging.info(f"[AvgAlign][{tag}] 无对应客户端对")
+                return
+            arr = np.array(values, dtype=np.float64)
+            logging.info(
+                f"[AvgAlign][{tag}] count={len(arr)}, mean={arr.mean():.4f}, std={arr.std():.4f}, "
+                f"min={arr.min():.4f}, max={arr.max():.4f}"
+            )
+
+        _log_stats("Benign-Benign", benign_pairs)
+        _log_stats("Benign-Malicious", mixed_pairs)
+        _log_stats("Malicious-Malicious", malicious_pairs)
+
+        return aggregated_update
 
     def agg_median(self, agent_updates_dict):
         """Coordinate-wise median aggregation."""
