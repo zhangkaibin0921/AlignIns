@@ -1088,7 +1088,7 @@ class Aggregation():
         self.fedid_reg = float(getattr(self.args, "fedid_reg", 1e-3))
         use_mpsa_prefilter = getattr(self.args, "use_mpsa_prefilter", False)
         use_norm_prefilter = getattr(self.args, "use_norm_prefilter", False)
-        norm_lower = float(getattr(self.args, "norm_prefilter_lower", 0.1))
+        norm_lower = float(getattr(self.args, "norm_prefilter_lower", 0.4))
         norm_upper = float(getattr(self.args, "norm_prefilter_upper", 3.0))
 
         client_ids = []
@@ -1276,6 +1276,17 @@ class Aggregation():
 
             _apply_range_filter(grad_l2, norm_lower, norm_upper, "L2")
             _apply_range_filter(grad_l1, norm_lower, norm_upper, "L1")
+
+            # 余弦相似性过滤
+            cosine_similarities = []
+            global_norm = np.linalg.norm(vectorize_global) + eps
+            for i in range(n):
+                client_model = vectorize_nets[i]
+                client_norm = np.linalg.norm(client_model) + eps
+                cosine_sim = np.dot(vectorize_global, client_model) / (global_norm * client_norm)
+                cosine_similarities.append(cosine_sim)
+            cosine_similarities = np.array(cosine_similarities)
+            _apply_range_filter(cosine_similarities, norm_lower, norm_upper, "Cosine")
 
             if len(allowed_set) == 0:
                 logging.info("[Scope][NormFilter] 无满足范数阈值的客户端，退化为使用全部客户端")

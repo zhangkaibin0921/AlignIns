@@ -151,7 +151,7 @@ if __name__ == "__main__":
     parser.add_argument("--candidate_seed_ratio", type=float, default=0.5, help="ratio of candidates for seed selection in ScopeMM")
     parser.add_argument("--fedid_reg", type=float, default=1e-3, help="regularization coefficient for FedID dynamic weighting in ScopeMM")
     parser.add_argument("--use_norm_prefilter", action="store_true", default=False, help="enable norm-based prefilter before MPSA in Scope aggregation")
-    parser.add_argument("--norm_prefilter_lower", type=float, default=0.1, help="lower multiplier (relative to median norm) for Scope norm prefilter")
+    parser.add_argument("--norm_prefilter_lower", type=float, default=0.4, help="lower multiplier (relative to median norm) for Scope norm prefilter")
     parser.add_argument("--norm_prefilter_upper", type=float, default=3.0, help="upper multiplier (relative to median norm) for Scope norm prefilter")
 
     args = parser.parse_args()
