@@ -1,4 +1,5 @@
 import copy
+import bisect
 
 import torch
 from torch.nn.utils import parameters_to_vector
@@ -55,7 +56,7 @@ class Aggregation():
         elif self.args.aggr == 'avg_align':
             aggregated_updates = self.agg_avg_alignment(agent_updates_dict)
         elif self.args.aggr == 'alignins':
-            aggregated_updates = self.agg_alignins(agent_updates_dict, cur_global_params)
+            aggregated_updates = self.agg_alignins(agent_updates_dict, global_model, cur_global_params)
         elif self.args.aggr == 'mpsa':
             aggregated_updates = self.agg_mpsa(agent_updates_dict, cur_global_params)
         elif self.args.aggr == 'mmetric':
@@ -106,7 +107,7 @@ class Aggregation():
         aggregated_model = gw
         return aggregated_model
 
-    def agg_alignins(self, agent_updates_dict, flat_global_model):
+    def agg_alignins(self, agent_updates_dict, global_model, flat_global_model):
         local_updates = []
         benign_id = []  # 实际干净的客户端ID（真实标签）
         malicious_id = []  # 实际恶意的客户端ID（真实标签）
@@ -122,13 +123,41 @@ class Aggregation():
         num_chosen_clients = len(chosen_clients)
         inter_model_updates = torch.stack(local_updates, dim=0)
 
+        # 仅在 VGG9（当前用于 CIFAR-100）下统计 Top-k 梯度在各层的占比
+        is_vgg9 = getattr(self.args, "data", "") == "cifar100"
+        layer_ranges = None
+        layer_hit_counts = None
+        if is_vgg9:
+            state_dict = global_model.state_dict()
+            layer_ranges = []
+            start = 0
+            layer_hit_counts = {}
+            for name, param in state_dict.items():
+                length = param.numel()
+                layer_ranges.append((name, start, start + length))
+                start += length
+                layer_hit_counts[name] = 0
+            layer_starts = [s for (_, s, _) in layer_ranges]
+
         tda_list = []
         mpsa_list = []
         major_sign = torch.sign(torch.sum(torch.sign(inter_model_updates), dim=0))
         cos = torch.nn.CosineSimilarity(dim=0, eps=1e-6)
+        total_topk = 0
         for i in range(len(inter_model_updates)):
-            _, init_indices = torch.topk(torch.abs(inter_model_updates[i]),
-                                         int(len(inter_model_updates[i]) * self.args.sparsity))
+            _, init_indices = torch.topk(
+                torch.abs(inter_model_updates[i]),
+                int(len(inter_model_updates[i]) * self.args.sparsity)
+            )
+            if is_vgg9 and layer_ranges is not None and len(init_indices) > 0:
+                idx_np = init_indices.detach().cpu().numpy().astype(int)
+                total_topk += idx_np.size
+                for flat_idx in idx_np:
+                    # 使用二分查找定位所属参数张量
+                    layer_idx = bisect.bisect_right(layer_starts, flat_idx) - 1
+                    if 0 <= layer_idx < len(layer_ranges):
+                        layer_name = layer_ranges[layer_idx][0]
+                        layer_hit_counts[layer_name] += 1
             # 计算MPSA
             mpsa = (torch.sum(
                 torch.sign(inter_model_updates[i][init_indices]) == major_sign[init_indices]) / torch.numel(
@@ -140,6 +169,16 @@ class Aggregation():
 
         logging.info('TDA: %s' % [round(i, 4) for i in tda_list])
         logging.info('MPSA: %s' % [round(i, 4) for i in mpsa_list])
+
+        # 打印 Top-k 梯度在各层的占比（仅 VGG9）
+        if is_vgg9 and layer_hit_counts is not None and total_topk > 0:
+            layer_ratios = {
+                name: count / total_topk for name, count in layer_hit_counts.items() if count > 0
+            }
+            # 按占比从大到小排序，便于观察主要来源层
+            sorted_items = sorted(layer_ratios.items(), key=lambda x: x[1], reverse=True)
+            pretty_ratios = {name: round(ratio, 4) for name, ratio in sorted_items}
+            logging.info(f"[AlignIns][VGG9] Top-{int(self.args.sparsity * 100)}%% 梯度在各层的占比: {pretty_ratios}")
 
         ######## MZ-score calculation ########
         # MPSA的MZ-score
