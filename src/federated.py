@@ -150,6 +150,7 @@ if __name__ == "__main__":
     parser.add_argument("--sparsity", type=float, default=0.3)
     parser.add_argument("--lambda_s", type=float, default=1.0)
     parser.add_argument("--lambda_c", type=float, default=1.0)
+    parser.add_argument("--alignins_layer_norm", action="store_true", default=False, help="enable layer-wise normalization for AlignIns aggregation")
     
     # ScopeMM aggregation method parameters
     parser.add_argument("--eps", type=float, default=1e-12, help="epsilon for numerical stability in ScopeMM")

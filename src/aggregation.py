@@ -123,21 +123,55 @@ class Aggregation():
         num_chosen_clients = len(chosen_clients)
         inter_model_updates = torch.stack(local_updates, dim=0)
 
-        # 仅在 VGG9（当前用于 CIFAR-100）下统计 Top-k 梯度在各层的占比
-        is_vgg9 = getattr(self.args, "data", "") == "cifar100"
-        layer_ranges = None
+        # 获取模型层结构信息（用于归一化和统计）
+        state_dict = global_model.state_dict()
+        layer_ranges = []
+        start = 0
+        for name, param in state_dict.items():
+            length = param.numel()
+            layer_ranges.append((name, start, start + length))
+            start += length
+        layer_starts = [s for (_, s, _) in layer_ranges]
+
+        # 分层归一化（Layer-wise normalization）
+        use_layer_norm = getattr(self.args, "alignins_layer_norm", False)
+        if use_layer_norm:
+            # 对每个客户端的更新进行分层归一化
+            normalized_updates = []
+            eps = 1e-8
+            for update in local_updates:
+                normalized_update = torch.zeros_like(update)
+                for name, start_idx, end_idx in layer_ranges:
+                    layer_grad = update[start_idx:end_idx]
+                    layer_norm = torch.norm(layer_grad)
+                    if layer_norm > eps:
+                        normalized_update[start_idx:end_idx] = layer_grad / layer_norm
+                    else:
+                        normalized_update[start_idx:end_idx] = layer_grad
+                normalized_updates.append(normalized_update)
+            inter_model_updates = torch.stack(normalized_updates, dim=0)
+            logging.info("[AlignIns] 已应用分层归一化（Layer-wise normalization）")
+
+        # 如果启用了分层归一化，也对全局模型进行归一化（用于 TDA 计算）
+        normalized_flat_global_model = flat_global_model
+        if use_layer_norm:
+            normalized_flat_global_model = torch.zeros_like(flat_global_model)
+            eps = 1e-8
+            for name, start_idx, end_idx in layer_ranges:
+                layer_grad = flat_global_model[start_idx:end_idx]
+                layer_norm = torch.norm(layer_grad)
+                if layer_norm > eps:
+                    normalized_flat_global_model[start_idx:end_idx] = layer_grad / layer_norm
+                else:
+                    normalized_flat_global_model[start_idx:end_idx] = layer_grad
+
+        # 仅在 VGG9（当前用于 CIFAR-10）下统计 Top-k 梯度在各层的占比
+        is_vgg9 = getattr(self.args, "data", "") == "cifar10"
         layer_hit_counts = None
         if is_vgg9:
-            state_dict = global_model.state_dict()
-            layer_ranges = []
-            start = 0
             layer_hit_counts = {}
-            for name, param in state_dict.items():
-                length = param.numel()
-                layer_ranges.append((name, start, start + length))
-                start += length
+            for name, _, _ in layer_ranges:
                 layer_hit_counts[name] = 0
-            layer_starts = [s for (_, s, _) in layer_ranges]
 
         tda_list = []
         mpsa_list = []
@@ -163,8 +197,8 @@ class Aggregation():
                 torch.sign(inter_model_updates[i][init_indices]) == major_sign[init_indices]) / torch.numel(
                 inter_model_updates[i][init_indices])).item()
             mpsa_list.append(mpsa)
-            # 计算TDA
-            tda = cos(inter_model_updates[i], flat_global_model).item()
+            # 计算TDA（使用归一化后的值）
+            tda = cos(inter_model_updates[i], normalized_flat_global_model).item()
             tda_list.append(tda)
 
         logging.info('TDA: %s' % [round(i, 4) for i in tda_list])
