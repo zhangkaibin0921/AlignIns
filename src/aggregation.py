@@ -20,6 +20,11 @@ try:
 except ImportError:  # pragma: no cover
     hdbscan = None
 
+try:
+    import finch
+except ImportError:  # pragma: no cover
+    finch = None
+
 
 class Aggregation():
     def __init__(self, agent_data_sizes, n_params, args):
@@ -175,10 +180,12 @@ class Aggregation():
 
         tda_list = []
         mpsa_list = []
+        # 计算主符号（基于归一化后的更新，如果启用了归一化）
         major_sign = torch.sign(torch.sum(torch.sign(inter_model_updates), dim=0))
         cos = torch.nn.CosineSimilarity(dim=0, eps=1e-6)
         total_topk = 0
         for i in range(len(inter_model_updates)):
+            # Top-k 选择（基于归一化后的更新，如果启用了归一化）
             _, init_indices = torch.topk(
                 torch.abs(inter_model_updates[i]),
                 int(len(inter_model_updates[i]) * self.args.sparsity)
@@ -192,7 +199,7 @@ class Aggregation():
                     if 0 <= layer_idx < len(layer_ranges):
                         layer_name = layer_ranges[layer_idx][0]
                         layer_hit_counts[layer_name] += 1
-            # 计算MPSA
+            # 计算MPSA（使用归一化后的更新，如果启用了归一化）
             mpsa = (torch.sum(
                 torch.sign(inter_model_updates[i][init_indices]) == major_sign[init_indices]) / torch.numel(
                 inter_model_updates[i][init_indices])).item()
@@ -568,6 +575,52 @@ class Aggregation():
                             allow_single_cluster=True,
                         )
                         cluster_labels = clusterer.fit(dist_matrix).labels_
+                elif cluster_method == "finch":
+                    if finch is None:  # pragma: no cover
+                        logging.warning("[AvgAlign][FINCH] finch 未安装，无法执行 FINCH 聚类")
+                    else:
+                        # FINCH works with feature vectors or distance matrix
+                        # Try using alignment matrix as similarity matrix first
+                        try:
+                            # Convert similarity matrix to distance matrix (like DBSCAN/HDBSCAN)
+                            dist_matrix = 1.0 - align_matrix
+                            np.fill_diagonal(dist_matrix, 0.0)  # Ensure diagonal is zero
+                            
+                            # Run FINCH clustering
+                            # FINCH returns: (partition_tree, num_clust, req_clust)
+                            # Try with distance='precomputed' first
+                            try:
+                                c, num_clust, req_c = finch.FINCH(
+                                    dist_matrix,
+                                    initial_rank=None,
+                                    req_clust=None,
+                                    distance='precomputed',
+                                    ensure_early_termination=True,
+                                    verbose=False
+                                )
+                            except (TypeError, ValueError):
+                                # If precomputed doesn't work, try using alignment matrix as features
+                                c, num_clust, req_c = finch.FINCH(
+                                    align_matrix,
+                                    initial_rank=None,
+                                    req_clust=None,
+                                    distance='euclidean',
+                                    ensure_early_termination=True,
+                                    verbose=False
+                                )
+                            
+                            # FINCH returns cluster assignments in the last column of partition tree c
+                            # The partition tree c has shape (n_clients, num_clust) where each column represents a different clustering level
+                            # We use the last column (most granular clustering)
+                            if c is not None and c.shape[1] > 0:
+                                cluster_labels = c[:, -1].astype(int)
+                                logging.info(f"[AvgAlign][FINCH] 检测到 {num_clust} 个聚类")
+                            else:
+                                logging.warning("[AvgAlign][FINCH] FINCH 未返回有效聚类结果，退化为使用全部客户端")
+                                cluster_labels = None
+                        except Exception as e:
+                            logging.warning(f"[AvgAlign][FINCH] FINCH 聚类执行失败: {e}，退化为使用全部客户端")
+                            cluster_labels = None
                 else:
                     logging.warning(f"[AvgAlign][Cluster] 未知聚类方法: {cluster_method}")
 
