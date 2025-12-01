@@ -664,18 +664,47 @@ class Aggregation():
                     logging.warning(f"[AvgAlign][Cluster] 未知聚类方法: {cluster_method}")
 
         if cluster_labels is not None:
+            # 先打印各簇的统计信息（仍然保留原有日志）
             cluster_stats = _report_clusters(cluster_labels, cluster_method.upper())
-            if cluster_stats:
-                valid_stats = [stat for stat in cluster_stats if stat[0] != -1]
-                if not valid_stats:
-                    valid_stats = cluster_stats
-                largest_cluster = max(valid_stats, key=lambda x: x[1])
-                selected_indices = largest_cluster[3].tolist()
+
+            # --- 关键修改 2: 基于全局中位数的鲁棒选择策略 ---
+            # 使用逐元素中位数作为“全局良性锚点”，只要恶意客户端 < 50%，中位数就会偏向良性方向
+            global_median_update = torch.median(stacked, dim=0).values
+
+            best_cluster = None  # (cluster_id, size, majority_type, member_idx)
+            best_dist = None
+
+            for stat in cluster_stats:
+                cluster_id, size, majority_type, member_idx = stat
+                if size == 0:
+                    continue
+
+                # member_idx 是该簇内客户端在 stacked 中的索引
+                member_tensor_idx = np.array(member_idx, dtype=int)
+                member_updates = stacked[member_tensor_idx]
+                cluster_centroid = torch.mean(member_updates, dim=0)
+
+                # 质心与全局中位数之间的 L2 距离，越小说明该簇整体越接近“良性方向”
+                dist_to_median = torch.norm(cluster_centroid - global_median_update).item()
                 logging.info(
-                    f"[AvgAlign][Cluster] 选用 cluster={largest_cluster[0]} 进行聚合，成员数={largest_cluster[1]}"
+                    f"[AvgAlign][ClusterSelect] cluster={cluster_id}, size={size}, "
+                    f"majority={majority_type}, dist_to_median={dist_to_median:.4f}"
+                )
+
+                if (best_dist is None) or (dist_to_median < best_dist):
+                    best_dist = dist_to_median
+                    best_cluster = stat
+
+            if best_cluster is not None:
+                chosen_cluster_id, chosen_size, _, chosen_member_idx = best_cluster
+                # numpy 索引转换为 Python 列表
+                selected_indices = np.array(chosen_member_idx, dtype=int).tolist()
+                logging.info(
+                    f"[AvgAlign][Cluster] 选用 cluster={chosen_cluster_id} 进行聚合，"
+                    f"成员数={chosen_size}, dist_to_median={best_dist:.4f}"
                 )
             else:
-                logging.info("[AvgAlign][Cluster] 未获得有效聚类结果，退化为使用全部客户端")
+                logging.info("[AvgAlign][Cluster] 未获得有效聚类结果（所有簇为空），退化为使用全部客户端")
 
         selected_client_ids = [client_ids[idx] for idx in selected_indices]
         selected_updates = {cid: agent_updates_dict[cid] for cid in selected_client_ids}
