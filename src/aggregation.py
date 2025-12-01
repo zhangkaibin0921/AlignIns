@@ -492,6 +492,45 @@ class Aggregation():
         _log_stats("Benign-Malicious", mixed_pairs)
         _log_stats("Malicious-Malicious", malicious_pairs)
 
+
+         # Global Min-Max normalization of the alignment matrix
+        eps = 1e-12
+        min_val = np.min(align_matrix)
+        max_val = np.max(align_matrix)
+        if abs(max_val - min_val) < eps:
+            # All values are the same, no normalization needed
+            align_matrix_normalized = align_matrix.copy()
+            logging.info("[AvgAlign] 对齐矩阵所有值相同，跳过标准化")
+        else:
+            # Min-Max normalization: (x - min) / (max - min)
+            align_matrix_normalized = (align_matrix - min_val) / (max_val - min_val)
+            # Ensure diagonal remains 1.0 (maximum similarity)
+            np.fill_diagonal(align_matrix_normalized, 1.0)
+            logging.info(f"[AvgAlign] 对齐矩阵 Min-Max 标准化: min={min_val:.4f}, max={max_val:.4f}")
+        
+        logging.info("[AvgAlign] Normalized pairwise sign-alignment matrix: %s", np.round(align_matrix_normalized, 3).tolist())
+
+        # Extract normalized pairs from the normalized matrix
+        benign_pairs_normalized = []
+        mixed_pairs_normalized = []
+        malicious_pairs_normalized = []
+        for i in range(n_clients):
+            for j in range(i + 1, n_clients):  # Skip diagonal (i == j)
+                id_i = client_ids[i]
+                id_j = client_ids[j]
+                normalized_score = align_matrix_normalized[i, j]
+                if id_i >= num_corrupt and id_j >= num_corrupt:
+                    benign_pairs_normalized.append(normalized_score)
+                elif id_i < num_corrupt and id_j < num_corrupt:
+                    malicious_pairs_normalized.append(normalized_score)
+                else:
+                    mixed_pairs_normalized.append(normalized_score)
+
+        logging.info("[AvgAlign] Normalized statistics:")
+        _log_stats("Benign-Benign (Normalized)", benign_pairs_normalized)
+        _log_stats("Benign-Malicious (Normalized)", mixed_pairs_normalized)
+        _log_stats("Malicious-Malicious (Normalized)", malicious_pairs_normalized)
+
         cluster_method = getattr(self.args, "align_cluster_method", "none").lower()
         selected_indices = list(range(n_clients))
 
@@ -511,7 +550,7 @@ class Aggregation():
                     f"benign={benign_cnt}, malicious={malicious_cnt}, members={member_ids}"
                 )
                 if len(member_idx) >= 2:
-                    sub_matrix = align_matrix[np.ix_(member_idx, member_idx)]
+                    sub_matrix = align_matrix_normalized[np.ix_(member_idx, member_idx)]
                     tril = np.tril_indices_from(sub_matrix, k=-1)
                     if len(tril[0]) > 0:
                         vals = sub_matrix[tril]
@@ -538,7 +577,7 @@ class Aggregation():
                             logging.info("[AvgAlign][KMeans] 聚类数为1，所有客户端视为同一簇")
                             cluster_labels = np.zeros(n_clients, dtype=int)
                         else:
-                            features = align_matrix
+                            features = align_matrix_normalized
                             try:
                                 kmeans = KMeans(n_clusters=cluster_k, n_init="auto", random_state=42)
                             except TypeError:
@@ -553,21 +592,21 @@ class Aggregation():
                         spectral = SpectralClustering(
                             n_clusters=cluster_k, affinity="precomputed", assign_labels="kmeans", random_state=42
                         )
-                        cluster_labels = spectral.fit_predict(align_matrix)
+                        cluster_labels = spectral.fit_predict(align_matrix_normalized)
                 elif cluster_method == "dbscan":
                     if DBSCAN is None:  # pragma: no cover
                         logging.warning("[AvgAlign][DBSCAN] sklearn 未安装，无法执行 DBSCAN 聚类")
                     else:
                         eps = float(getattr(self.args, "align_dbscan_eps", 0.3))
                         min_samples = int(getattr(self.args, "align_dbscan_min_samples", 2))
-                        dist_matrix = 1.0 - align_matrix
+                        dist_matrix = 1.0 - align_matrix_normalized
                         dbscan = DBSCAN(eps=eps, min_samples=min_samples, metric="precomputed")
                         cluster_labels = dbscan.fit_predict(dist_matrix)
                 elif cluster_method == "hdbscan":
                     if hdbscan is None:  # pragma: no cover
                         logging.warning("[AvgAlign][HDBSCAN] hdbscan 未安装，无法执行 HDBSCAN 聚类")
                     else:
-                        dist_matrix = 1.0 - align_matrix
+                        dist_matrix = 1.0 - align_matrix_normalized
                         clusterer = hdbscan.HDBSCAN(
                             metric="precomputed",
                             min_cluster_size=max(2, n_clients // 2 + 1),
@@ -583,7 +622,7 @@ class Aggregation():
                         # Try using alignment matrix as similarity matrix first
                         try:
                             # Convert similarity matrix to distance matrix (like DBSCAN/HDBSCAN)
-                            dist_matrix = 1.0 - align_matrix
+                            dist_matrix = 1.0 - align_matrix_normalized
                             np.fill_diagonal(dist_matrix, 0.0)  # Ensure diagonal is zero
                             
                             # Run FINCH clustering
@@ -601,7 +640,7 @@ class Aggregation():
                             except (TypeError, ValueError):
                                 # If precomputed doesn't work, try using alignment matrix as features
                                 c, num_clust, req_c = finch.FINCH(
-                                    align_matrix,
+                                    align_matrix_normalized,
                                     initial_rank=None,
                                     req_clust=None,
                                     distance='euclidean',
