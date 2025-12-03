@@ -62,6 +62,8 @@ class Aggregation():
             aggregated_updates = self.agg_avg_alignment(agent_updates_dict)
         elif self.args.aggr == 'alignins':
             aggregated_updates = self.agg_alignins(agent_updates_dict, global_model, cur_global_params)
+        elif self.args.aggr == 'median_guard':
+            aggregated_updates = self.agg_median_guard(agent_updates_dict, cur_global_params)
         elif self.args.aggr == 'mpsa':
             aggregated_updates = self.agg_mpsa(agent_updates_dict, cur_global_params)
         elif self.args.aggr == 'mmetric':
@@ -318,6 +320,145 @@ class Aggregation():
         logging.info('TPR:       %.4f' % TPR)
 
         current_dict = {chosen_clients[idx]: benign_updates[idx] for idx in benign_idx}
+        aggregated_update = self.agg_avg(current_dict)
+        return aggregated_update
+
+    def agg_median_guard(self, agent_updates_dict, flat_global_model):
+        """
+        Median-anchored defense (参考 AlignIns 思路，但以中位数聚合结果为“主符号”与锚点):
+        1. 先对所有客户端更新做逐坐标中位数聚合，得到 tmp（全局中位数更新）。
+        2. 以 tmp 的符号作为“主符号”，对每个客户端计算：
+           - MPSA-like：在 top-k 重要坐标上，与 tmp 主符号的一致比例（主符号相似度）
+           - TDA-like：整体向量与 tmp 的余弦相似度
+        3. 分别对这两个分数做 MZ-score，低于阈值 lambda_s / lambda_c 的视为异常，剔除。
+        4. 对剩余客户端做加权平均聚合。
+        """
+        local_updates = []
+        benign_id = []
+        malicious_id = []
+
+        for _id, update in agent_updates_dict.items():
+            local_updates.append(update)
+            if _id < self.args.num_corrupt:
+                malicious_id.append(_id)
+            else:
+                benign_id.append(_id)
+
+        client_ids = malicious_id + benign_id
+        num_clients = len(client_ids)
+        if num_clients == 0:
+            return torch.zeros_like(flat_global_model)
+        if num_clients == 1:
+            # 只有一个客户端，直接返回
+            return local_updates[0]
+
+        # 按照 client_ids 的顺序重新堆叠 updates（保持与 malicious+benign 顺序一致）
+        ordered_updates = [agent_updates_dict[cid] for cid in client_ids]
+        stacked = torch.stack(ordered_updates, dim=0)  # [N, D]
+
+        # 1) 中位数聚合得到 tmp
+        tmp = torch.median(stacked, dim=0).values  # [D]
+
+        # 2) 以 tmp 的符号作为“主符号”，计算 MPSA-like & TDA-like
+        sparsity = float(getattr(self.args, "sparsity", 0.3))
+        lambda_s = float(getattr(self.args, "lambda_s", 1.0))
+        lambda_c = float(getattr(self.args, "lambda_c", 1.0))
+        eps = float(getattr(self.args, "eps", 1e-12))
+
+        major_sign = torch.sign(tmp)
+        tmp_norm = torch.norm(tmp).item()
+        if tmp_norm <= eps:
+            # 锚点几乎为零向量时，直接退化为普通 median 聚合
+            logging.info("[MedianGuard] tmp 近似零向量，退化为纯中位数聚合")
+            return tmp
+
+        dim = tmp.numel()
+        topk_dim = max(1, int(dim * sparsity))
+
+        mpsa_scores = []
+        tda_scores = []
+        for i in range(num_clients):
+            vec = stacked[i]
+
+            # Top-k 重要坐标（按绝对值）
+            _, topk_idx = torch.topk(torch.abs(vec), k=topk_dim)
+
+            # MPSA-like：与 tmp 主符号的一致性
+            sign_vec = torch.sign(vec[topk_idx])
+            agree = torch.sum(sign_vec == major_sign[topk_idx]).item()
+            mpsa = agree / float(topk_dim)
+            mpsa_scores.append(mpsa)
+
+            # TDA-like：与 tmp 的余弦相似度
+            vec_norm = torch.norm(vec).item()
+            if vec_norm > eps:
+                tda = float(torch.dot(vec, tmp).item() / (vec_norm * tmp_norm))
+            else:
+                tda = 0.0
+            tda_scores.append(tda)
+
+        logging.info('[MedianGuard] MPSA-like scores: %s' % [round(x, 4) for x in mpsa_scores])
+        logging.info('[MedianGuard] TDA-like scores: %s' % [round(x, 4) for x in tda_scores])
+
+        # 3) MZ-score 过滤
+        def _mz_filter(scores, lam, tag):
+            """
+            仅过滤“相似度过低”的客户端：
+            - 以中位数为中心，只关注比分布中心显著更低的一侧（单侧过滤）
+            - 过高的相似度不会被视为异常
+            """
+            arr = np.array(scores, dtype=np.float64)
+            if arr.size <= 1:
+                # 只有 1 个或 0 个客户端时，直接全部保留
+                return set(range(len(scores)))
+            std = np.std(arr)
+            med = np.median(arr)
+            std = std if std > 1e-12 else 1.0
+
+            # 单侧 MZ-score：只看“低于中位数”的幅度
+            # mz_low = (med - score) / std，越大说明越“低”
+            mz_low = (med - arr) / std
+            logging.info(f"[MedianGuard] One-sided MZ-score(low) of {tag}: %s" %
+                         [round(v, 4) for v in mz_low])
+
+            # 保留条件：不过低 => mz_low < lam （或 score >= med - lam*std）
+            keep_mask = mz_low < lam
+            keep = set(np.argwhere(keep_mask).flatten().astype(int).tolist())
+            return keep
+
+        keep_mpsa = _mz_filter(mpsa_scores, lambda_s, "MPSA")
+        keep_tda = _mz_filter(tda_scores, lambda_c, "TDA")
+
+        # 交集作为最终保留的客户端索引（相对于 client_ids 的索引）
+        keep_idx_set = keep_mpsa.intersection(keep_tda)
+        keep_idx = sorted(list(keep_idx_set))
+
+        if len(keep_idx) == 0:
+            logging.info("[MedianGuard] 过滤后无客户端被保留，返回零更新")
+            return torch.zeros_like(flat_global_model)
+
+        # 统计 TPR / FPR
+        correct = 0
+        for idx in keep_idx:
+            if client_ids[idx] in benign_id:
+                correct += 1
+        TPR = correct / len(benign_id) if len(benign_id) > 0 else 0.0
+
+        FPR = 0.0
+        if len(malicious_id) > 0:
+            wrong = 0
+            for idx in keep_idx:
+                if client_ids[idx] in malicious_id:
+                    wrong += 1
+            FPR = wrong / len(malicious_id)
+
+        logging.info('[MedianGuard] benign update index:   %s' % str(benign_id))
+        logging.info('[MedianGuard] selected update index: %s' % str([client_ids[i] for i in keep_idx]))
+        logging.info('[MedianGuard] FPR:       %.4f' % FPR)
+        logging.info('[MedianGuard] TPR:       %.4f' % TPR)
+
+        # 4) 对保留客户端做加权平均聚合（按样本量）
+        current_dict = {client_ids[i]: ordered_updates[i] for i in keep_idx}
         aggregated_update = self.agg_avg(current_dict)
         return aggregated_update
 
