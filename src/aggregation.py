@@ -445,38 +445,66 @@ class Aggregation():
 
         sign_updates = torch.sign(stacked)
         align_matrix = np.zeros((n_clients, n_clients), dtype=np.float64)
+        cosine_matrix = np.zeros((n_clients, n_clients), dtype=np.float64)
+        # 二维特征矩阵: [n_clients, n_clients, 2] - 每个元素是 [cosine_sim, align_score]
+        feature_matrix = np.zeros((n_clients, n_clients, 2), dtype=np.float64)
 
         benign_pairs = []
         mixed_pairs = []
         malicious_pairs = []
+        benign_cosine_pairs = []
+        mixed_cosine_pairs = []
+        malicious_cosine_pairs = []
         num_corrupt = int(getattr(self.args, "num_corrupt", 0))
+        eps = 1e-8
 
         for i in range(n_clients):
             for j in range(i, n_clients):
                 if i == j:
                     align_matrix[i, j] = 1.0
+                    cosine_matrix[i, j] = 1.0
+                    feature_matrix[i, j] = [1.0, 1.0]
                     continue
 
                 common_mask = topk_mask[i] & topk_mask[j]
                 intersect_count = int(common_mask.sum().item())
+                
                 if intersect_count == 0:
                     align_score = 0.0
+                    cosine_sim = 0.0
                 else:
+                    # 计算符号一致性
                     same_sign = torch.sum(sign_updates[i][common_mask] == sign_updates[j][common_mask]).item()
                     align_score = same_sign / intersect_count
+                    
+                    # 计算余弦相似度（使用相同的 top30% 梯度）
+                    vec_i = stacked[i][common_mask]
+                    vec_j = stacked[j][common_mask]
+                    norm_i = torch.norm(vec_i)
+                    norm_j = torch.norm(vec_j)
+                    if norm_i > eps and norm_j > eps:
+                        cosine_sim = torch.dot(vec_i, vec_j).item() / (norm_i * norm_j)
+                    else:
+                        cosine_sim = 0.0
 
                 align_matrix[i, j] = align_matrix[j, i] = align_score
+                cosine_matrix[i, j] = cosine_matrix[j, i] = cosine_sim
+                feature_matrix[i, j] = feature_matrix[j, i] = [cosine_sim, align_score]
 
                 id_i = client_ids[i]
                 id_j = client_ids[j]
                 if id_i >= num_corrupt and id_j >= num_corrupt:
                     benign_pairs.append(align_score)
+                    benign_cosine_pairs.append(cosine_sim)
                 elif id_i < num_corrupt and id_j < num_corrupt:
                     malicious_pairs.append(align_score)
+                    malicious_cosine_pairs.append(cosine_sim)
                 else:
                     mixed_pairs.append(align_score)
+                    mixed_cosine_pairs.append(cosine_sim)
 
         logging.info("[AvgAlign] Pairwise sign-alignment matrix: %s", np.round(align_matrix, 3).tolist())
+        logging.info("[AvgAlign] Pairwise cosine similarity matrix: %s", np.round(cosine_matrix, 3).tolist())
 
         def _log_stats(tag, values):
             if len(values) == 0:
@@ -488,48 +516,81 @@ class Aggregation():
                 f"min={arr.min():.4f}, max={arr.max():.4f}"
             )
 
-        _log_stats("Benign-Benign", benign_pairs)
-        _log_stats("Benign-Malicious", mixed_pairs)
-        _log_stats("Malicious-Malicious", malicious_pairs)
+        _log_stats("Benign-Benign (Align)", benign_pairs)
+        _log_stats("Benign-Malicious (Align)", mixed_pairs)
+        _log_stats("Malicious-Malicious (Align)", malicious_pairs)
+        _log_stats("Benign-Benign (Cosine)", benign_cosine_pairs)
+        _log_stats("Benign-Malicious (Cosine)", mixed_cosine_pairs)
+        _log_stats("Malicious-Malicious (Cosine)", malicious_cosine_pairs)
 
 
-         # Global Min-Max normalization of the alignment matrix
+         # Min-Max normalization of the feature matrix (二维特征归一化)
         eps = 1e-12
-        min_val = np.min(align_matrix)
-        max_val = np.max(align_matrix)
-        if abs(max_val - min_val) < eps:
-            # All values are the same, no normalization needed
+        # 分别对余弦相似度和符号一致性进行归一化
+        cosine_vals = cosine_matrix[np.triu_indices_from(cosine_matrix, k=1)]
+        align_vals = align_matrix[np.triu_indices_from(align_matrix, k=1)]
+        
+        # 归一化余弦相似度
+        cosine_min = np.min(cosine_vals) if len(cosine_vals) > 0 else 0.0
+        cosine_max = np.max(cosine_vals) if len(cosine_vals) > 0 else 1.0
+        if abs(cosine_max - cosine_min) < eps:
+            cosine_matrix_normalized = cosine_matrix.copy()
+            logging.info("[AvgAlign] 余弦相似度矩阵所有值相同，跳过标准化")
+        else:
+            cosine_matrix_normalized = (cosine_matrix - cosine_min) / (cosine_max - cosine_min)
+            np.fill_diagonal(cosine_matrix_normalized, 1.0)
+            logging.info(f"[AvgAlign] 余弦相似度矩阵 Min-Max 标准化: min={cosine_min:.4f}, max={cosine_max:.4f}")
+        
+        # 归一化符号一致性
+        align_min = np.min(align_vals) if len(align_vals) > 0 else 0.0
+        align_max = np.max(align_vals) if len(align_vals) > 0 else 1.0
+        if abs(align_max - align_min) < eps:
             align_matrix_normalized = align_matrix.copy()
             logging.info("[AvgAlign] 对齐矩阵所有值相同，跳过标准化")
         else:
-            # Min-Max normalization: (x - min) / (max - min)
-            align_matrix_normalized = (align_matrix - min_val) / (max_val - min_val)
-            # Ensure diagonal remains 1.0 (maximum similarity)
+            align_matrix_normalized = (align_matrix - align_min) / (align_max - align_min)
             np.fill_diagonal(align_matrix_normalized, 1.0)
-            logging.info(f"[AvgAlign] 对齐矩阵 Min-Max 标准化: min={min_val:.4f}, max={max_val:.4f}")
+            logging.info(f"[AvgAlign] 对齐矩阵 Min-Max 标准化: min={align_min:.4f}, max={align_max:.4f}")
+        
+        # 构建归一化后的二维特征矩阵
+        feature_matrix_normalized = np.zeros((n_clients, n_clients, 2), dtype=np.float64)
+        for i in range(n_clients):
+            for j in range(n_clients):
+                feature_matrix_normalized[i, j] = [cosine_matrix_normalized[i, j], align_matrix_normalized[i, j]]
         
         logging.info("[AvgAlign] Normalized pairwise sign-alignment matrix: %s", np.round(align_matrix_normalized, 3).tolist())
+        logging.info("[AvgAlign] Normalized pairwise cosine similarity matrix: %s", np.round(cosine_matrix_normalized, 3).tolist())
 
         # Extract normalized pairs from the normalized matrix
         benign_pairs_normalized = []
         mixed_pairs_normalized = []
         malicious_pairs_normalized = []
+        benign_cosine_normalized = []
+        mixed_cosine_normalized = []
+        malicious_cosine_normalized = []
         for i in range(n_clients):
             for j in range(i + 1, n_clients):  # Skip diagonal (i == j)
                 id_i = client_ids[i]
                 id_j = client_ids[j]
-                normalized_score = align_matrix_normalized[i, j]
+                normalized_align = align_matrix_normalized[i, j]
+                normalized_cosine = cosine_matrix_normalized[i, j]
                 if id_i >= num_corrupt and id_j >= num_corrupt:
-                    benign_pairs_normalized.append(normalized_score)
+                    benign_pairs_normalized.append(normalized_align)
+                    benign_cosine_normalized.append(normalized_cosine)
                 elif id_i < num_corrupt and id_j < num_corrupt:
-                    malicious_pairs_normalized.append(normalized_score)
+                    malicious_pairs_normalized.append(normalized_align)
+                    malicious_cosine_normalized.append(normalized_cosine)
                 else:
-                    mixed_pairs_normalized.append(normalized_score)
+                    mixed_pairs_normalized.append(normalized_align)
+                    mixed_cosine_normalized.append(normalized_cosine)
 
         logging.info("[AvgAlign] Normalized statistics:")
-        _log_stats("Benign-Benign (Normalized)", benign_pairs_normalized)
-        _log_stats("Benign-Malicious (Normalized)", mixed_pairs_normalized)
-        _log_stats("Malicious-Malicious (Normalized)", malicious_pairs_normalized)
+        _log_stats("Benign-Benign (Align Normalized)", benign_pairs_normalized)
+        _log_stats("Benign-Malicious (Align Normalized)", mixed_pairs_normalized)
+        _log_stats("Malicious-Malicious (Align Normalized)", malicious_pairs_normalized)
+        _log_stats("Benign-Benign (Cosine Normalized)", benign_cosine_normalized)
+        _log_stats("Benign-Malicious (Cosine Normalized)", mixed_cosine_normalized)
+        _log_stats("Malicious-Malicious (Cosine Normalized)", malicious_cosine_normalized)
 
         cluster_method = getattr(self.args, "align_cluster_method", "none").lower()
         selected_indices = list(range(n_clients))
@@ -550,16 +611,57 @@ class Aggregation():
                     f"benign={benign_cnt}, malicious={malicious_cnt}, members={member_ids}"
                 )
                 if len(member_idx) >= 2:
-                    sub_matrix = align_matrix_normalized[np.ix_(member_idx, member_idx)]
-                    tril = np.tril_indices_from(sub_matrix, k=-1)
+                    # 报告符号一致性统计
+                    sub_align = align_matrix_normalized[np.ix_(member_idx, member_idx)]
+                    tril = np.tril_indices_from(sub_align, k=-1)
                     if len(tril[0]) > 0:
-                        vals = sub_matrix[tril]
+                        align_vals = sub_align[tril]
                         logging.info(
-                            f"[AvgAlign][{method_name}][cluster={cluster_id}] pairwise align mean={vals.mean():.4f}, "
-                            f"std={vals.std():.4f}, min={vals.min():.4f}, max={vals.max():.4f}"
+                            f"[AvgAlign][{method_name}][cluster={cluster_id}] pairwise align mean={align_vals.mean():.4f}, "
+                            f"std={align_vals.std():.4f}, min={align_vals.min():.4f}, max={align_vals.max():.4f}"
+                        )
+                    # 报告余弦相似度统计
+                    sub_cosine = cosine_matrix_normalized[np.ix_(member_idx, member_idx)]
+                    if len(tril[0]) > 0:
+                        cosine_vals = sub_cosine[tril]
+                        logging.info(
+                            f"[AvgAlign][{method_name}][cluster={cluster_id}] pairwise cosine mean={cosine_vals.mean():.4f}, "
+                            f"std={cosine_vals.std():.4f}, min={cosine_vals.min():.4f}, max={cosine_vals.max():.4f}"
+                        )
+                    # 报告二维特征距离统计
+                    sub_dist = feature_dist_matrix[np.ix_(member_idx, member_idx)]
+                    if len(tril[0]) > 0:
+                        dist_vals = sub_dist[tril]
+                        logging.info(
+                            f"[AvgAlign][{method_name}][cluster={cluster_id}] pairwise feature distance mean={dist_vals.mean():.4f}, "
+                            f"std={dist_vals.std():.4f}, min={dist_vals.min():.4f}, max={dist_vals.max():.4f}"
                         )
                 stats.append((cluster_id, len(member_idx), majority_type, member_idx))
             return stats
+
+        # 从归一化后的二维特征计算距离矩阵（用于聚类）
+        # 距离 = 1 - 相似度，其中相似度基于二维特征的欧氏距离
+        # 对于每个客户端对 (i, j)，计算二维特征 [cosine_sim, align_score] 的欧氏距离
+        feature_dist_matrix = np.zeros((n_clients, n_clients), dtype=np.float64)
+        for i in range(n_clients):
+            for j in range(n_clients):
+                if i == j:
+                    feature_dist_matrix[i, j] = 0.0
+                else:
+                    # 计算归一化后的二维特征的欧氏距离
+                    feat_i = feature_matrix_normalized[i, j]  # [cosine_sim, align_score]
+                    # 由于特征矩阵是对称的，feat_i 和 feat_j 应该相同
+                    # 但为了清晰，我们使用标准的距离计算方式
+                    # 实际上，对于对称矩阵，我们可以直接计算 1 - 相似度
+                    # 这里我们使用：距离 = sqrt((1-cosine)^2 + (1-align)^2)
+                    cosine_sim = feat_i[0]
+                    align_score = feat_i[1]
+                    # 将相似度转换为距离：距离越大，相似度越小
+                    dist = np.sqrt((1.0 - cosine_sim) ** 2 + (1.0 - align_score) ** 2)
+                    feature_dist_matrix[i, j] = dist
+        
+        logging.info("[AvgAlign] 基于二维特征的距离矩阵已计算完成")
+        logging.info("[AvgAlign] Feature distance matrix: %s", np.round(feature_dist_matrix, 3).tolist())
 
         cluster_labels = None
         cluster_stats = []
@@ -577,60 +679,69 @@ class Aggregation():
                             logging.info("[AvgAlign][KMeans] 聚类数为1，所有客户端视为同一簇")
                             cluster_labels = np.zeros(n_clients, dtype=int)
                         else:
-                            features = align_matrix_normalized
+                            # 使用二维特征：每个客户端表示为与其他所有客户端的平均特征向量
+                            # 或者直接使用距离矩阵进行 KMeans（需要转换为特征向量）
+                            # 这里我们使用每个客户端与其他所有客户端的平均二维特征
+                            client_features = np.zeros((n_clients, 2), dtype=np.float64)
+                            for i in range(n_clients):
+                                # 计算客户端 i 与其他所有客户端的平均二维特征
+                                other_features = feature_matrix_normalized[i, :, :]  # [n_clients, 2]
+                                # 排除自己（对角线）
+                                mask = np.arange(n_clients) != i
+                                if mask.any():
+                                    client_features[i] = np.mean(other_features[mask], axis=0)
+                                else:
+                                    client_features[i] = [1.0, 1.0]  # 默认值
+                            
+                            logging.info("[AvgAlign][KMeans] 使用二维特征进行聚类: [平均余弦相似度, 平均符号一致性]")
                             try:
                                 kmeans = KMeans(n_clusters=cluster_k, n_init="auto", random_state=42)
                             except TypeError:
                                 kmeans = KMeans(n_clusters=cluster_k, n_init=10, random_state=42)
-                            cluster_labels = kmeans.fit_predict(features)
+                            cluster_labels = kmeans.fit_predict(client_features)
                 elif cluster_method == "spectral":
                     if SpectralClustering is None:  # pragma: no cover
                         logging.warning("[AvgAlign][Spectral] sklearn 未安装，无法执行谱聚类")
                     else:
                         cluster_k = int(getattr(self.args, "align_spectral_clusters", 2))
                         cluster_k = max(2, min(cluster_k, n_clients))
+                        # 将距离矩阵转换为相似度矩阵（用于谱聚类）
+                        similarity_matrix = 1.0 / (1.0 + feature_dist_matrix)
+                        np.fill_diagonal(similarity_matrix, 1.0)
                         spectral = SpectralClustering(
                             n_clusters=cluster_k, affinity="precomputed", assign_labels="kmeans", random_state=42
                         )
-                        cluster_labels = spectral.fit_predict(align_matrix_normalized)
+                        cluster_labels = spectral.fit_predict(similarity_matrix)
                 elif cluster_method == "dbscan":
                     if DBSCAN is None:  # pragma: no cover
                         logging.warning("[AvgAlign][DBSCAN] sklearn 未安装，无法执行 DBSCAN 聚类")
                     else:
                         eps = float(getattr(self.args, "align_dbscan_eps", 0.3))
                         min_samples = int(getattr(self.args, "align_dbscan_min_samples", 2))
-                        dist_matrix = 1.0 - align_matrix_normalized
                         dbscan = DBSCAN(eps=eps, min_samples=min_samples, metric="precomputed")
-                        cluster_labels = dbscan.fit_predict(dist_matrix)
+                        cluster_labels = dbscan.fit_predict(feature_dist_matrix)
                 elif cluster_method == "hdbscan":
                     if hdbscan is None:  # pragma: no cover
                         logging.warning("[AvgAlign][HDBSCAN] hdbscan 未安装，无法执行 HDBSCAN 聚类")
                     else:
-                        dist_matrix = 1.0 - align_matrix_normalized
                         clusterer = hdbscan.HDBSCAN(
                             metric="precomputed",
                             min_cluster_size=max(2, n_clients // 2 + 1),
                             min_samples=1,
                             allow_single_cluster=True,
                         )
-                        cluster_labels = clusterer.fit(dist_matrix).labels_
+                        cluster_labels = clusterer.fit(feature_dist_matrix).labels_
                 elif cluster_method == "finch":
                     if finch is None:  # pragma: no cover
                         logging.warning("[AvgAlign][FINCH] finch 未安装，无法执行 FINCH 聚类")
                     else:
-                        # FINCH works with feature vectors or distance matrix
-                        # Try using alignment matrix as similarity matrix first
                         try:
-                            # Convert similarity matrix to distance matrix (like DBSCAN/HDBSCAN)
-                            dist_matrix = 1.0 - align_matrix_normalized
-                            np.fill_diagonal(dist_matrix, 0.0)  # Ensure diagonal is zero
+                            # 使用基于二维特征的距离矩阵
+                            np.fill_diagonal(feature_dist_matrix, 0.0)  # 确保对角线为0
                             
-                            # Run FINCH clustering
-                            # FINCH returns: (partition_tree, num_clust, req_clust)
-                            # Try with distance='precomputed' first
                             try:
                                 c, num_clust, req_c = finch.FINCH(
-                                    dist_matrix,
+                                    feature_dist_matrix,
                                     initial_rank=None,
                                     req_clust=None,
                                     distance='precomputed',
@@ -638,9 +749,16 @@ class Aggregation():
                                     verbose=False
                                 )
                             except (TypeError, ValueError):
-                                # If precomputed doesn't work, try using alignment matrix as features
+                                # 如果 precomputed 不工作，尝试使用特征向量
+                                client_features = np.zeros((n_clients, 2), dtype=np.float64)
+                                for i in range(n_clients):
+                                    mask = np.arange(n_clients) != i
+                                    if mask.any():
+                                        client_features[i] = np.mean(feature_matrix_normalized[i, mask, :], axis=0)
+                                    else:
+                                        client_features[i] = [1.0, 1.0]
                                 c, num_clust, req_c = finch.FINCH(
-                                    align_matrix_normalized,
+                                    client_features,
                                     initial_rank=None,
                                     req_clust=None,
                                     distance='euclidean',
@@ -648,9 +766,6 @@ class Aggregation():
                                     verbose=False
                                 )
                             
-                            # FINCH returns cluster assignments in the last column of partition tree c
-                            # The partition tree c has shape (n_clients, num_clust) where each column represents a different clustering level
-                            # We use the last column (most granular clustering)
                             if c is not None and c.shape[1] > 0:
                                 cluster_labels = c[:, -1].astype(int)
                                 logging.info(f"[AvgAlign][FINCH] 检测到 {num_clust} 个聚类")
@@ -667,12 +782,13 @@ class Aggregation():
             # 先打印各簇的统计信息（仍然保留原有日志）
             cluster_stats = _report_clusters(cluster_labels, cluster_method.upper())
 
-            # --- 关键修改 2: 基于全局中位数的鲁棒选择策略 ---
-            # 使用逐元素中位数作为“全局良性锚点”，只要恶意客户端 < 50%，中位数就会偏向良性方向
+            # 基于全局中位数 + 余弦相似度的鲁棒选择策略（不使用真实标签信息）
+            # 使用逐元素中位数作为“全局锚点”，只要恶意客户端 < 50%，中位数就会偏向良性方向
             global_median_update = torch.median(stacked, dim=0).values
 
             best_cluster = None  # (cluster_id, size, majority_type, member_idx)
             best_dist = None
+            best_cos = None
 
             for stat in cluster_stats:
                 cluster_id, size, majority_type, member_idx = stat
@@ -684,16 +800,38 @@ class Aggregation():
                 member_updates = stacked[member_tensor_idx]
                 cluster_centroid = torch.mean(member_updates, dim=0)
 
-                # 质心与全局中位数之间的 L2 距离，越小说明该簇整体越接近“良性方向”
-                dist_to_median = torch.norm(cluster_centroid - global_median_update).item()
+                # 质心与全局中位数之间的 L2 距离（越小越好）
+                diff = cluster_centroid - global_median_update
+                dist_to_median = torch.norm(diff).item()
+
+                # 质心与全局中位数的余弦相似度（越大越好）
+                cos_sim = torch.nn.functional.cosine_similarity(
+                    cluster_centroid.view(1, -1),
+                    global_median_update.view(1, -1),
+                    dim=1,
+                    eps=1e-12,
+                ).item()
+
                 logging.info(
                     f"[AvgAlign][ClusterSelect] cluster={cluster_id}, size={size}, "
-                    f"majority={majority_type}, dist_to_median={dist_to_median:.4f}"
+                    f"majority={majority_type}, dist_to_median={dist_to_median:.4f}, cos_to_median={cos_sim:.4f}"
                 )
 
-                if (best_dist is None) or (dist_to_median < best_dist):
+                # 先按 L2 距离排序，若距离非常接近（差异 < 1e-3），再用余弦相似度作为次级比较指标
+                if best_dist is None:
                     best_dist = dist_to_median
+                    best_cos = cos_sim
                     best_cluster = stat
+                else:
+                    dist_diff = dist_to_median - best_dist
+                    if dist_diff < -1e-3:  # 明显更近
+                        best_dist = dist_to_median
+                        best_cos = cos_sim
+                        best_cluster = stat
+                    elif abs(dist_diff) <= 1e-3 and cos_sim > best_cos:  # 距离几乎一样，用余弦相似度打平
+                        best_dist = dist_to_median
+                        best_cos = cos_sim
+                        best_cluster = stat
 
             if best_cluster is not None:
                 chosen_cluster_id, chosen_size, _, chosen_member_idx = best_cluster
@@ -701,7 +839,7 @@ class Aggregation():
                 selected_indices = np.array(chosen_member_idx, dtype=int).tolist()
                 logging.info(
                     f"[AvgAlign][Cluster] 选用 cluster={chosen_cluster_id} 进行聚合，"
-                    f"成员数={chosen_size}, dist_to_median={best_dist:.4f}"
+                    f"成员数={chosen_size}, dist_to_median={best_dist:.4f}, cos_to_median={best_cos:.4f}"
                 )
             else:
                 logging.info("[AvgAlign][Cluster] 未获得有效聚类结果（所有簇为空），退化为使用全部客户端")
