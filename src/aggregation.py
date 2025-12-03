@@ -964,56 +964,42 @@ class Aggregation():
             # 先打印各簇的统计信息（仍然保留原有日志）
             cluster_stats = _report_clusters(cluster_labels, cluster_method.upper())
 
-            # 基于全局中位数 + 余弦相似度的鲁棒选择策略（不使用真实标签信息）
-            # 使用逐元素中位数作为“全局锚点”，只要恶意客户端 < 50%，中位数就会偏向良性方向
-            global_median_update = torch.median(stacked, dim=0).values
-
+            # 基于“簇质量（Cohesion）”的选择策略：
+            # Score_k = Size_k * AvgPairwiseCosine_k
+            # - Size_k：簇大小（成员数）
+            # - AvgPairwiseCosine_k：簇内两两客户端余弦相似度的平均值（使用归一化后的 cosine_matrix_normalized）
             best_cluster = None  # (cluster_id, size, majority_type, member_idx)
-            best_dist = None
-            best_cos = None
+            best_score = None
+            best_avg_cos = None
 
             for stat in cluster_stats:
                 cluster_id, size, majority_type, member_idx = stat
                 if size == 0:
                     continue
 
-                # member_idx 是该簇内客户端在 stacked 中的索引
                 member_tensor_idx = np.array(member_idx, dtype=int)
-                member_updates = stacked[member_tensor_idx]
-                cluster_centroid = torch.mean(member_updates, dim=0)
 
-                # 质心与全局中位数之间的 L2 距离（越小越好）
-                diff = cluster_centroid - global_median_update
-                dist_to_median = torch.norm(diff).item()
+                # 计算簇内两两归一化余弦相似度的平均值
+                sub_cos = cosine_matrix_normalized[np.ix_(member_tensor_idx, member_tensor_idx)]
+                tril = np.tril_indices_from(sub_cos, k=-1)
+                if len(tril[0]) > 0:
+                    pair_vals = sub_cos[tril]
+                    avg_pair_cos = float(pair_vals.mean())
+                else:
+                    # 只有 1 个成员的簇，没有成对相似度，默认认为内聚度为 1.0
+                    avg_pair_cos = 1.0
 
-                # 质心与全局中位数的余弦相似度（越大越好）
-                cos_sim = torch.nn.functional.cosine_similarity(
-                    cluster_centroid.view(1, -1),
-                    global_median_update.view(1, -1),
-                    dim=1,
-                    eps=1e-12,
-                ).item()
+                score = size * avg_pair_cos
 
                 logging.info(
                     f"[AvgAlign][ClusterSelect] cluster={cluster_id}, size={size}, "
-                    f"majority={majority_type}, dist_to_median={dist_to_median:.4f}, cos_to_median={cos_sim:.4f}"
+                    f"majority={majority_type}, avg_pairwise_cos={avg_pair_cos:.4f}, score={score:.4f}"
                 )
 
-                # 先按 L2 距离排序，若距离非常接近（差异 < 1e-3），再用余弦相似度作为次级比较指标
-                if best_dist is None:
-                    best_dist = dist_to_median
-                    best_cos = cos_sim
+                if best_score is None or score > best_score:
+                    best_score = score
+                    best_avg_cos = avg_pair_cos
                     best_cluster = stat
-                else:
-                    dist_diff = dist_to_median - best_dist
-                    if dist_diff < -1e-3:  # 明显更近
-                        best_dist = dist_to_median
-                        best_cos = cos_sim
-                        best_cluster = stat
-                    elif abs(dist_diff) <= 1e-3 and cos_sim > best_cos:  # 距离几乎一样，用余弦相似度打平
-                        best_dist = dist_to_median
-                        best_cos = cos_sim
-                        best_cluster = stat
 
             if best_cluster is not None:
                 chosen_cluster_id, chosen_size, _, chosen_member_idx = best_cluster
@@ -1021,7 +1007,7 @@ class Aggregation():
                 selected_indices = np.array(chosen_member_idx, dtype=int).tolist()
                 logging.info(
                     f"[AvgAlign][Cluster] 选用 cluster={chosen_cluster_id} 进行聚合，"
-                    f"成员数={chosen_size}, dist_to_median={best_dist:.4f}, cos_to_median={best_cos:.4f}"
+                    f"成员数={chosen_size}, avg_pairwise_cos={best_avg_cos:.4f}, score={best_score:.4f}"
                 )
             else:
                 logging.info("[AvgAlign][Cluster] 未获得有效聚类结果（所有簇为空），退化为使用全部客户端")
