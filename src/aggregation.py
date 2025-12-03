@@ -475,15 +475,15 @@ class Aggregation():
                 else:
                     # 计算符号一致性
                     same_sign = torch.sum(sign_updates[i][common_mask] == sign_updates[j][common_mask]).item()
-                    align_score = same_sign / intersect_count
+                    align_score = float(same_sign / intersect_count)
                     
                     # 计算余弦相似度（使用相同的 top30% 梯度）
                     vec_i = stacked[i][common_mask]
                     vec_j = stacked[j][common_mask]
-                    norm_i = torch.norm(vec_i)
-                    norm_j = torch.norm(vec_j)
+                    norm_i = torch.norm(vec_i).item()
+                    norm_j = torch.norm(vec_j).item()
                     if norm_i > eps and norm_j > eps:
-                        cosine_sim = torch.dot(vec_i, vec_j).item() / (norm_i * norm_j)
+                        cosine_sim = float(torch.dot(vec_i, vec_j).item() / (norm_i * norm_j))
                     else:
                         cosine_sim = 0.0
 
