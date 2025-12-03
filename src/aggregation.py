@@ -461,9 +461,10 @@ class Aggregation():
         for i in range(n_clients):
             for j in range(i, n_clients):
                 if i == j:
+                    # 对角线：符号对齐率为1，余弦相似度为0（不考虑客户端与自身）
                     align_matrix[i, j] = 1.0
-                    cosine_matrix[i, j] = 1.0
-                    feature_matrix[i, j] = [1.0, 1.0]
+                    cosine_matrix[i, j] = 0.0
+                    feature_matrix[i, j] = [0.0, 1.0]
                     continue
 
                 common_mask = topk_mask[i] & topk_mask[j]
@@ -525,32 +526,48 @@ class Aggregation():
 
 
          # Min-Max normalization of the feature matrix (二维特征归一化)
+        # 归一化时排除对角线数据（客户端与自身的数据）
         eps = 1e-12
-        # 分别对余弦相似度和符号一致性进行归一化
-        cosine_vals = cosine_matrix[np.triu_indices_from(cosine_matrix, k=1)]
-        align_vals = align_matrix[np.triu_indices_from(align_matrix, k=1)]
+        # 分别对余弦相似度和符号一致性进行归一化，只使用上三角（不含对角线，k=1）
+        triu_indices = np.triu_indices_from(cosine_matrix, k=1)
+        cosine_vals = cosine_matrix[triu_indices]
+        align_vals = align_matrix[triu_indices]
         
-        # 归一化余弦相似度
-        cosine_min = np.min(cosine_vals) if len(cosine_vals) > 0 else 0.0
-        cosine_max = np.max(cosine_vals) if len(cosine_vals) > 0 else 1.0
+        # 归一化余弦相似度（基于非对角线数据）
+        if len(cosine_vals) > 0:
+            cosine_min = np.min(cosine_vals)
+            cosine_max = np.max(cosine_vals)
+        else:
+            cosine_min = 0.0
+            cosine_max = 1.0
+        
         if abs(cosine_max - cosine_min) < eps:
             cosine_matrix_normalized = cosine_matrix.copy()
-            logging.info("[AvgAlign] 余弦相似度矩阵所有值相同，跳过标准化")
+            logging.info("[AvgAlign] 余弦相似度矩阵所有非对角线值相同，跳过标准化")
         else:
+            # 归一化整个矩阵（包括对角线），但归一化参数基于非对角线数据
             cosine_matrix_normalized = (cosine_matrix - cosine_min) / (cosine_max - cosine_min)
-            np.fill_diagonal(cosine_matrix_normalized, 1.0)
-            logging.info(f"[AvgAlign] 余弦相似度矩阵 Min-Max 标准化: min={cosine_min:.4f}, max={cosine_max:.4f}")
+            # 对角线保持为0（客户端与自身的余弦相似度不考虑，设为0）
+            np.fill_diagonal(cosine_matrix_normalized, 0.0)
+            logging.info(f"[AvgAlign] 余弦相似度矩阵 Min-Max 标准化（排除对角线）: min={cosine_min:.4f}, max={cosine_max:.4f}")
         
-        # 归一化符号一致性
-        align_min = np.min(align_vals) if len(align_vals) > 0 else 0.0
-        align_max = np.max(align_vals) if len(align_vals) > 0 else 1.0
+        # 归一化符号一致性（基于非对角线数据）
+        if len(align_vals) > 0:
+            align_min = np.min(align_vals)
+            align_max = np.max(align_vals)
+        else:
+            align_min = 0.0
+            align_max = 1.0
+        
         if abs(align_max - align_min) < eps:
             align_matrix_normalized = align_matrix.copy()
-            logging.info("[AvgAlign] 对齐矩阵所有值相同，跳过标准化")
+            logging.info("[AvgAlign] 对齐矩阵所有非对角线值相同，跳过标准化")
         else:
+            # 归一化整个矩阵（包括对角线），但归一化参数基于非对角线数据
             align_matrix_normalized = (align_matrix - align_min) / (align_max - align_min)
+            # 对角线保持为1（客户端与自身的符号对齐率）
             np.fill_diagonal(align_matrix_normalized, 1.0)
-            logging.info(f"[AvgAlign] 对齐矩阵 Min-Max 标准化: min={align_min:.4f}, max={align_max:.4f}")
+            logging.info(f"[AvgAlign] 对齐矩阵 Min-Max 标准化（排除对角线）: min={align_min:.4f}, max={align_max:.4f}")
         
         # 构建归一化后的二维特征矩阵
         feature_matrix_normalized = np.zeros((n_clients, n_clients, 2), dtype=np.float64)
