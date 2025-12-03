@@ -64,6 +64,8 @@ class Aggregation():
             aggregated_updates = self.agg_alignins(agent_updates_dict, global_model, cur_global_params)
         elif self.args.aggr == 'median_guard':
             aggregated_updates = self.agg_median_guard(agent_updates_dict, cur_global_params)
+        elif self.args.aggr == 'median_guard_align':
+            aggregated_updates = self.agg_median_guard_avg_align(agent_updates_dict, global_model, cur_global_params)
         elif self.args.aggr == 'mpsa':
             aggregated_updates = self.agg_mpsa(agent_updates_dict, cur_global_params)
         elif self.args.aggr == 'mmetric':
@@ -323,22 +325,15 @@ class Aggregation():
         aggregated_update = self.agg_avg(current_dict)
         return aggregated_update
 
-    def agg_median_guard(self, agent_updates_dict, flat_global_model):
+    def _median_guard_select(self, agent_updates_dict, flat_global_model):
         """
-        Median-anchored defense (参考 AlignIns 思路，但以中位数聚合结果为“主符号”与锚点):
-        1. 先对所有客户端更新做逐坐标中位数聚合，得到 tmp（全局中位数更新）。
-        2. 以 tmp 的符号作为“主符号”，对每个客户端计算：
-           - MPSA-like：在 top-k 重要坐标上，与 tmp 主符号的一致比例（主符号相似度）
-           - TDA-like：整体向量与 tmp 的余弦相似度
-        3. 分别对这两个分数做 MZ-score，低于阈值 lambda_s / lambda_c 的视为异常，剔除。
-        4. 对剩余客户端做加权平均聚合。
+        核心筛选逻辑：返回通过 MedianGuard 过滤后的客户端字典以及可选的回退值。
+        回退值用于处理 degenerate 情况（例如 tmp 近似 0 向量）。
         """
-        local_updates = []
         benign_id = []
         malicious_id = []
 
         for _id, update in agent_updates_dict.items():
-            local_updates.append(update)
             if _id < self.args.num_corrupt:
                 malicious_id.append(_id)
             else:
@@ -347,13 +342,13 @@ class Aggregation():
         client_ids = malicious_id + benign_id
         num_clients = len(client_ids)
         if num_clients == 0:
-            return torch.zeros_like(flat_global_model)
+            return {}, torch.zeros_like(flat_global_model)
+        ordered_updates = [agent_updates_dict[cid] for cid in client_ids]
         if num_clients == 1:
-            # 只有一个客户端，直接返回
-            return local_updates[0]
+            # 只有一个客户端，直接保留该客户端
+            return {client_ids[0]: ordered_updates[0]}, None
 
         # 按照 client_ids 的顺序重新堆叠 updates（保持与 malicious+benign 顺序一致）
-        ordered_updates = [agent_updates_dict[cid] for cid in client_ids]
         stacked = torch.stack(ordered_updates, dim=0)  # [N, D]
 
         # 1) 中位数聚合得到 tmp
@@ -368,9 +363,9 @@ class Aggregation():
         major_sign = torch.sign(tmp)
         tmp_norm = torch.norm(tmp).item()
         if tmp_norm <= eps:
-            # 锚点几乎为零向量时，直接退化为普通 median 聚合
+            # 锚点几乎为零向量时，直接退化为纯中位数聚合
             logging.info("[MedianGuard] tmp 近似零向量，退化为纯中位数聚合")
-            return tmp
+            return {}, tmp
 
         dim = tmp.numel()
         topk_dim = max(1, int(dim * sparsity))
@@ -435,7 +430,7 @@ class Aggregation():
 
         if len(keep_idx) == 0:
             logging.info("[MedianGuard] 过滤后无客户端被保留，返回零更新")
-            return torch.zeros_like(flat_global_model)
+            return {}, torch.zeros_like(flat_global_model)
 
         # 统计 TPR / FPR
         correct = 0
@@ -457,9 +452,38 @@ class Aggregation():
         logging.info('[MedianGuard] FPR:       %.4f' % FPR)
         logging.info('[MedianGuard] TPR:       %.4f' % TPR)
 
-        # 4) 对保留客户端做加权平均聚合（按样本量）
-        current_dict = {client_ids[i]: ordered_updates[i] for i in keep_idx}
-        aggregated_update = self.agg_avg(current_dict)
+        selected_updates = {client_ids[i]: ordered_updates[i] for i in keep_idx}
+        return selected_updates, None
+
+    def agg_median_guard(self, agent_updates_dict, flat_global_model):
+        """
+        Median-anchored defense (参考 AlignIns 思路，但以中位数聚合结果为“主符号”与锚点):
+        1. 先对所有客户端更新做逐坐标中位数聚合，得到 tmp（全局中位数更新）。
+        2. 以 tmp 的符号作为“主符号”，对每个客户端计算：
+           - MPSA-like：在 top-k 重要坐标上，与 tmp 主符号的一致比例（主符号相似度）
+           - TDA-like：整体向量与 tmp 的余弦相似度
+        3. 分别对这两个分数做 MZ-score，低于阈值 lambda_s / lambda_c 的视为异常，剔除。
+        4. 对剩余客户端做加权平均聚合。
+        """
+        selected_updates, fallback = self._median_guard_select(agent_updates_dict, flat_global_model)
+        if fallback is not None:
+            return fallback
+        if len(selected_updates) == 0:
+            return torch.zeros_like(flat_global_model)
+        aggregated_update = self.agg_avg(selected_updates)
+        return aggregated_update
+
+    def agg_median_guard_avg_align(self, agent_updates_dict, global_model, flat_global_model):
+        """
+        组合防御：先运行 MedianGuard 过滤客户端，再对保留下来的客户端执行 avg_align。
+        """
+        selected_updates, fallback = self._median_guard_select(agent_updates_dict, flat_global_model)
+        if fallback is not None:
+            return fallback
+        if len(selected_updates) == 0:
+            return torch.zeros_like(flat_global_model)
+        # 在过滤后的客户端集合上运行 avg_align（内部已包含加权聚合逻辑）
+        aggregated_update = self.agg_avg_alignment(selected_updates)
         return aggregated_update
 
     def agg_mpsa(self, agent_updates_dict, flat_global_model):

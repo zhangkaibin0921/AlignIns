@@ -127,7 +127,8 @@ if __name__ == "__main__":
             "scope",
             "mpsaguard",
             "mpsa",
-            "median_guard"
+            "median_guard",
+            "median_guard_align"
         ],
         help="aggregation function to aggregate agents' local weights",
     )
