@@ -72,7 +72,7 @@ class Agent():
 
     def update_mask(self, masks, num_remove, gradient=None):
         for name in gradient:
-            if self.args.dis_check_gradient:
+            if getattr(self.args, "dis_check_gradient", False):
                 temp = torch.where(masks[name] == 0, torch.ones_like(masks[name]), torch.zeros_like(masks[name]))
                 idx = torch.multinomial(temp.flatten().to(self.args.device), num_remove[name], replacement=False)
                 masks[name].view(-1)[idx] = 1

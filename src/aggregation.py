@@ -107,11 +107,12 @@ class Aggregation():
 
         n = len(local_updates)
         temp_updates = torch.stack(local_updates, dim=0)
-        weights = torch.ones(n).to(self.args.device)  
-        gw = compute_geometric_median(local_updates, weights).median
+        weights = torch.ones(n).to(self.args.device)
+        # compute_geometric_median 内部会用 numpy 处理 weights，这里传入 CPU numpy 避免 CUDA 转换错误
+        gw = compute_geometric_median(local_updates, weights.detach().cpu().numpy()).median
         for i in range(2):
             weights = torch.mul(weights, torch.exp(-1.0*torch.norm(temp_updates-gw, dim=1)))
-            gw = compute_geometric_median(local_updates, weights).median
+            gw = compute_geometric_median(local_updates, weights.detach().cpu().numpy()).median
 
         aggregated_model = gw
         return aggregated_model
