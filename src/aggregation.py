@@ -989,7 +989,7 @@ class Aggregation():
                     # 只有 1 个成员的簇，没有成对相似度，默认认为内聚度为 1.0
                     avg_pair_cos = 1.0
 
-                score = size * avg_pair_cos
+                score = size * (1 + avg_pair_cos)
 
                 logging.info(
                     f"[AvgAlign][ClusterSelect] cluster={cluster_id}, size={size}, "
