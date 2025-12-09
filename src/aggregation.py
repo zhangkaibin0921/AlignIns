@@ -107,14 +107,23 @@ class Aggregation():
 
         n = len(local_updates)
         temp_updates = torch.stack(local_updates, dim=0)
-        weights = torch.ones(n).to(self.args.device)
-        # compute_geometric_median 内部会用 numpy 处理 weights，这里传入 CPU numpy 避免 CUDA 转换错误
-        gw = compute_geometric_median(local_updates, weights.detach().cpu().numpy()).median
+        weights = torch.ones(n, dtype=torch.float64).to(self.args.device)
+        # compute_geometric_median 需要 weights 是 torch tensor，并且需要和 local_updates 在同一设备上
+        # 如果 local_updates 在 CUDA，需要先移到 CPU（因为 geom_median 库可能不支持 CUDA）
+        if self.args.device != 'cpu':
+            local_updates_cpu = [up.cpu() for up in local_updates]
+            weights_cpu = weights.cpu()
+            temp_updates_cpu = temp_updates.cpu()
+        else:
+            local_updates_cpu = local_updates
+            weights_cpu = weights
+            temp_updates_cpu = temp_updates
+        gw = compute_geometric_median(local_updates_cpu, weights_cpu).median
         for i in range(2):
-            weights = torch.mul(weights, torch.exp(-1.0*torch.norm(temp_updates-gw, dim=1)))
-            gw = compute_geometric_median(local_updates, weights.detach().cpu().numpy()).median
-
-        aggregated_model = gw
+            weights_cpu = torch.mul(weights_cpu, torch.exp(-1.0*torch.norm(temp_updates_cpu-gw, dim=1)))
+            gw = compute_geometric_median(local_updates_cpu, weights_cpu).median
+        # 将结果移回原始设备
+        aggregated_model = gw.to(self.args.device)
         return aggregated_model
 
     def agg_alignins(self, agent_updates_dict, global_model, flat_global_model):
