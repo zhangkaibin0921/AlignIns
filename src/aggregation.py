@@ -418,11 +418,16 @@ class Aggregation():
             anchor_vector = g_history
             logging.info("[TDA-Only] 使用上一轮global model作为TDA锚点")
 
-        # 计算TDA（余弦相似度）
+        # 计算TDA（余弦相似度），仅在每个客户端自身的 Top-k 重要坐标上计算
+        # Top-k 比例沿用 self.args.sparsity（默认 0.3），与 AlignIns 的 MPSA Top-k 一致
         tda_list = []
         cos = torch.nn.CosineSimilarity(dim=0, eps=eps)
+        topk_dim = max(1, int(inter_model_updates.shape[1] * float(getattr(self.args, "sparsity", 0.3))))
         for i in range(len(inter_model_updates)):
-            tda = cos(inter_model_updates[i], anchor_vector).item()
+            _, topk_idx = torch.topk(torch.abs(inter_model_updates[i]), k=topk_dim)
+            vec_i = inter_model_updates[i][topk_idx]
+            vec_anchor = anchor_vector[topk_idx]
+            tda = cos(vec_i, vec_anchor).item()
             tda_list.append(tda)
 
         logging.info('[TDA-Only] TDA scores: %s' % [round(i, 4) for i in tda_list])
