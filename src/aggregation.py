@@ -62,6 +62,8 @@ class Aggregation():
             aggregated_updates = self.agg_avg_alignment(agent_updates_dict)
         elif self.args.aggr == 'alignins':
             aggregated_updates = self.agg_alignins(agent_updates_dict, global_model, cur_global_params)
+        elif self.args.aggr == 'tda_only':
+            aggregated_updates = self.agg_tda_only(agent_updates_dict, global_model, cur_global_params)
         elif self.args.aggr == 'median_guard':
             aggregated_updates = self.agg_median_guard(agent_updates_dict, cur_global_params)
         elif self.args.aggr == 'median_guard_align':
@@ -332,6 +334,129 @@ class Aggregation():
         logging.info('TPR:       %.4f' % TPR)
 
         current_dict = {chosen_clients[idx]: benign_updates[idx] for idx in benign_idx}
+        aggregated_update = self.agg_avg(current_dict)
+        return aggregated_update
+
+    def agg_tda_only(self, agent_updates_dict, global_model, flat_global_model):
+        """
+        仅使用TDA（Top-k Direction Alignment）的防御方法，参考AlignIns。
+        
+        特点：
+        1. 只计算TDA，不使用MPSA
+        2. 通过开关控制TDA的参考向量：
+           - use_median_anchor=False（默认）：对照上一轮的global model（类似AlignIns）
+           - use_median_anchor=True：对照中位数聚合结果（类似MedianGuard）
+        3. 双侧MZ-score过滤，过滤偏离中位数过远的客户端（过高或过低）
+        """
+        local_updates = []
+        benign_id = []
+        malicious_id = []
+
+        for _id, update in agent_updates_dict.items():
+            local_updates.append(update)
+            if _id < self.args.num_corrupt:
+                malicious_id.append(_id)
+            else:
+                benign_id.append(_id)
+
+        chosen_clients = malicious_id + benign_id
+        num_chosen_clients = len(chosen_clients)
+        if num_chosen_clients == 0:
+            return torch.zeros_like(flat_global_model)
+        if num_chosen_clients == 1:
+            return local_updates[0]
+
+        inter_model_updates = torch.stack(local_updates, dim=0)
+
+        # 确定TDA的参考向量（锚点）
+        use_median_anchor = getattr(self.args, "tda_use_median_anchor", False)
+        eps = 1e-8
+        
+        if use_median_anchor:
+            # 使用中位数聚合作为锚点
+            anchor_vector = torch.median(inter_model_updates, dim=0).values
+            logging.info("[TDA-Only] 使用中位数聚合作为TDA锚点")
+        else:
+            # 使用上一轮的global model作为锚点（默认，类似AlignIns）
+            anchor_vector = flat_global_model
+            logging.info("[TDA-Only] 使用上一轮global model作为TDA锚点")
+
+        # 计算TDA（余弦相似度）
+        tda_list = []
+        cos = torch.nn.CosineSimilarity(dim=0, eps=eps)
+        for i in range(len(inter_model_updates)):
+            tda = cos(inter_model_updates[i], anchor_vector).item()
+            tda_list.append(tda)
+
+        logging.info('[TDA-Only] TDA scores: %s' % [round(i, 4) for i in tda_list])
+
+        # MZ-score计算（双侧过滤）
+        tda_std = np.std(tda_list) if len(tda_list) > 1 else 1e-12
+        tda_med = np.median(tda_list)
+        tda_std = tda_std if tda_std > eps else 1.0
+        
+        # 双侧MZ-score：计算与中位数的绝对偏差
+        mzscore_tda = [np.abs(t - tda_med) / tda_std for t in tda_list]
+        
+        logging.info('MZ-score of TDA: %s' % [round(i, 4) for i in mzscore_tda])
+
+        # TDA筛选出的良性索引（双侧过滤）
+        lambda_c = float(getattr(self.args, "lambda_c", 1.0))
+        benign_idx = set(range(num_chosen_clients))
+        benign_idx.intersection_update(
+            set(np.argwhere(np.array(mzscore_tda) < lambda_c).flatten().astype(int))
+        )
+        benign_idx = sorted(list(benign_idx))
+
+        # 计算TDA的Precision
+        def _calc_precision(selected_indices, chosen_ids, actual_benign_ids):
+            selected_count = len(selected_indices)
+            if selected_count == 0:
+                return None, selected_count, 0
+            true_clean_count = 0
+            for idx in selected_indices:
+                actual_id = chosen_ids[idx]
+                if actual_id in actual_benign_ids:
+                    true_clean_count += 1
+            precision = true_clean_count / selected_count
+            return precision, selected_count, true_clean_count
+
+        tda_precision, tda_selected, tda_true_clean = _calc_precision(benign_idx, chosen_clients, benign_id)
+        if tda_precision is not None:
+            logging.info(
+                f"[TDA-Only] 识别的干净客户端准确率(Precision): {tda_precision:.4f}  |  选中数: {tda_selected}  真正干净数: {tda_true_clean}")
+        else:
+            logging.info(f"[TDA-Only] 无选中客户端，无法计算干净客户端准确率")
+
+        if len(benign_idx) == 0:
+            logging.info("[TDA-Only] 过滤后无客户端被保留，返回零更新")
+            return torch.zeros_like(local_updates[0])
+
+        # 直接使用过滤后的更新
+        benign_updates = torch.stack([local_updates[i] for i in benign_idx], dim=0)
+
+        # TPR/FPR计算
+        correct = 0
+        for idx in benign_idx:
+            if chosen_clients[idx] in benign_id:
+                correct += 1
+        TPR = correct / len(benign_id) if len(benign_id) > 0 else 0.0
+
+        FPR = 0.0
+        if len(malicious_id) > 0:
+            wrong = 0
+            for idx in benign_idx:
+                if chosen_clients[idx] in malicious_id:
+                    wrong += 1
+            FPR = wrong / len(malicious_id)
+
+        logging.info('[TDA-Only] benign update index:   %s' % str(benign_id))
+        logging.info('[TDA-Only] selected update index: %s' % str([chosen_clients[idx] for idx in benign_idx]))
+        logging.info('[TDA-Only] FPR:       %.4f' % FPR)
+        logging.info('[TDA-Only] TPR:       %.4f' % TPR)
+
+        # 加权平均聚合
+        current_dict = {chosen_clients[idx]: benign_updates[i] for i, idx in enumerate(benign_idx)}
         aggregated_update = self.agg_avg(current_dict)
         return aggregated_update
 
