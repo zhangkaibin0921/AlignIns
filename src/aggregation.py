@@ -368,17 +368,54 @@ class Aggregation():
 
         inter_model_updates = torch.stack(local_updates, dim=0)
 
+        # 计算三个关键向量用于分析
+        eps = 1e-8
+        
+        # g_true: 所有良性客户端更新的平均值（Ground Truth）
+        # 注意：local_updates 的顺序与 agent_updates_dict 的键顺序一致
+        # 需要根据 benign_id 从 agent_updates_dict 中提取对应的更新
+        if len(benign_id) > 0:
+            benign_dict = {bid: agent_updates_dict[bid] for bid in benign_id if bid in agent_updates_dict}
+            if len(benign_dict) > 0:
+                g_true = self.agg_avg(benign_dict)
+            else:
+                g_true = torch.zeros_like(flat_global_model)
+                logging.warning("[TDA-Only] 良性客户端不在 agent_updates_dict 中，无法计算 g_true")
+        else:
+            g_true = torch.zeros_like(flat_global_model)
+            logging.warning("[TDA-Only] 无良性客户端，无法计算 g_true")
+        
+        # g_history: 上一轮的全局更新（AlignIns Anchor）
+        g_history = flat_global_model
+        
+        # g_median: 当前轮次计算出的坐标中位数向量（FedCODA Anchor）
+        g_median = torch.median(inter_model_updates, dim=0).values
+        
+        # 计算余弦相似度
+        def _cosine_sim(vec1, vec2):
+            norm1 = torch.norm(vec1)
+            norm2 = torch.norm(vec2)
+            if norm1 > eps and norm2 > eps:
+                return float(torch.dot(vec1, vec2).item() / (norm1 * norm2))
+            else:
+                return 0.0
+        
+        sim_alignins = _cosine_sim(g_history, g_true)
+        sim_fedcoda = _cosine_sim(g_median, g_true)
+        
+        logging.info(f"[TDA-Only] Sim_AlignIns (Cosine(g_history, g_true)): {sim_alignins:.6f}")
+        logging.info(f"[TDA-Only] Sim_FedCODA (Cosine(g_median, g_true)): {sim_fedcoda:.6f}")
+
         # 确定TDA的参考向量（锚点）
         use_median_anchor = getattr(self.args, "tda_use_median_anchor", False)
-        eps = 1e-8
         
         if use_median_anchor:
             # 使用中位数聚合作为锚点
-            anchor_vector = torch.median(inter_model_updates, dim=0).values
+            anchor_vector = g_median
             logging.info("[TDA-Only] 使用中位数聚合作为TDA锚点")
         else:
             # 使用上一轮的global model作为锚点（默认，类似AlignIns）
-            anchor_vector = flat_global_model
+            anchor_vector = g_history
             logging.info("[TDA-Only] 使用上一轮global model作为TDA锚点")
 
         # 计算TDA（余弦相似度）
