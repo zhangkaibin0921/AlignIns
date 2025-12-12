@@ -778,7 +778,7 @@ class Aggregation():
         stacked = torch.stack(local_updates, dim=0)
         n_clients, dim = stacked.shape
 
-        topk_ratio = 0.3
+        topk_ratio = float(getattr(self.args, "avg_align_topk_ratio", 0.3))
         topk_dim = max(1, int(dim * topk_ratio))
         abs_updates = torch.abs(stacked)
         topk_indices = torch.topk(abs_updates, k=topk_dim, dim=1).indices

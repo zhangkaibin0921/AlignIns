@@ -155,6 +155,7 @@ if __name__ == "__main__":
     parser.add_argument("--lambda_c", type=float, default=1.0)
     parser.add_argument("--alignins_layer_norm", action="store_true", default=False, help="enable layer-wise normalization for AlignIns aggregation")
     parser.add_argument("--tda_use_median_anchor", action="store_true", default=False, help="use median aggregation as TDA anchor (False=use global model, True=use median)")
+    parser.add_argument("--avg_align_topk_ratio", type=float, default=0.3, help="top-k ratio used in avg_align sign-alignment (default 0.3)")
     
     # ScopeMM aggregation method parameters
     parser.add_argument("--eps", type=float, default=1e-12, help="epsilon for numerical stability in ScopeMM")
