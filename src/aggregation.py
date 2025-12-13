@@ -799,6 +799,9 @@ class Aggregation():
         malicious_cosine_pairs = []
         num_corrupt = int(getattr(self.args, "num_corrupt", 0))
         eps = 1e-8
+        
+        # 用于统计选择的梯度比例
+        gradient_ratio_list = []
 
         for i in range(n_clients):
             for j in range(i, n_clients):
@@ -811,6 +814,10 @@ class Aggregation():
 
                 common_mask = topk_mask[i] & topk_mask[j]
                 intersect_count = int(common_mask.sum().item())
+                
+                # 计算选择的梯度占全部梯度的比例
+                gradient_ratio = intersect_count / dim if dim > 0 else 0.0
+                gradient_ratio_list.append(gradient_ratio)
                 
                 if intersect_count == 0:
                     align_score = 0.0
@@ -845,6 +852,18 @@ class Aggregation():
                 else:
                     mixed_pairs.append(align_score)
                     mixed_cosine_pairs.append(cosine_sim)
+
+        # 打印选择的梯度占全部梯度的比例统计
+        if len(gradient_ratio_list) > 0:
+            gradient_ratio_arr = np.array(gradient_ratio_list)
+            logging.info(
+                f"[AvgAlign] 选择的梯度占全部梯度的比例统计: "
+                f"mean={gradient_ratio_arr.mean():.6f}, "
+                f"std={gradient_ratio_arr.std():.6f}, "
+                f"min={gradient_ratio_arr.min():.6f}, "
+                f"max={gradient_ratio_arr.max():.6f}, "
+                f"median={np.median(gradient_ratio_arr):.6f}"
+            )
 
         logging.info("[AvgAlign] Pairwise sign-alignment matrix: %s", np.round(align_matrix, 3).tolist())
         logging.info("[AvgAlign] Pairwise cosine similarity matrix: %s", np.round(cosine_matrix, 3).tolist())
