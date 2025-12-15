@@ -129,6 +129,7 @@ if __name__ == "__main__":
             "mpsa",
             "median_guard",
             "median_guard_align",
+            "median_guard_align2",
             "tda_only"
         ],
         help="aggregation function to aggregate agents' local weights",

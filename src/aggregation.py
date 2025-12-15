@@ -68,6 +68,8 @@ class Aggregation():
             aggregated_updates = self.agg_median_guard(agent_updates_dict, cur_global_params)
         elif self.args.aggr == 'median_guard_align':
             aggregated_updates = self.agg_median_guard_avg_align(agent_updates_dict, global_model, cur_global_params)
+        elif self.args.aggr == 'median_guard_align2':
+            aggregated_updates = self.agg_median_guard_avg_align2(agent_updates_dict, global_model, cur_global_params)
         elif self.args.aggr == 'mpsa':
             aggregated_updates = self.agg_mpsa(agent_updates_dict, cur_global_params)
         elif self.args.aggr == 'mmetric':
@@ -668,6 +670,24 @@ class Aggregation():
             return torch.zeros_like(flat_global_model)
         # 在过滤后的客户端集合上运行 avg_align（内部已包含加权聚合逻辑）
         aggregated_update = self.agg_avg_alignment(selected_updates)
+        return aggregated_update
+
+    def agg_median_guard_avg_align2(self, agent_updates_dict, global_model, flat_global_model):
+        """
+        组合防御2：先运行 avg_align，再运行 MedianGuard 过滤。
+        - 先用 avg_align 得到基线聚合结果 baseline_update
+        - 再用 MedianGuard 过滤客户端；如无客户端通过，回退到 baseline_update
+        """
+        baseline_update = self.agg_avg_alignment(agent_updates_dict)
+
+        selected_updates, fallback = self._median_guard_select(agent_updates_dict, flat_global_model)
+        if fallback is not None:
+            return fallback
+        if len(selected_updates) == 0:
+            logging.info("[MedianGuard+AvgAlign2] 过滤后无客户端通过，回退使用 avg_align 聚合结果")
+            return baseline_update
+
+        aggregated_update = self.agg_avg(selected_updates)
         return aggregated_update
 
     def agg_mpsa(self, agent_updates_dict, flat_global_model):
