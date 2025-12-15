@@ -573,11 +573,13 @@ class Aggregation():
         logging.info('[MedianGuard] TDA-like scores: %s' % [round(x, 4) for x in tda_scores])
 
         # 3) MZ-score 过滤
+        use_two_sided_mz = bool(getattr(self.args, "median_guard_two_sided", False))
+
         def _mz_filter(scores, lam, tag):
             """
-            仅过滤“相似度过低”的客户端：
-            - 以中位数为中心，只关注比分布中心显著更低的一侧（单侧过滤）
-            - 过高的相似度不会被视为异常
+            MZ 过滤：
+            - 默认单侧：仅过滤相似度过低（比分布中心显著更低）的客户端
+            - 若启用 two-sided：相似度过高或过低都会被过滤
             """
             arr = np.array(scores, dtype=np.float64)
             if arr.size <= 1:
@@ -587,14 +589,19 @@ class Aggregation():
             med = np.median(arr)
             std = std if std > 1e-12 else 1.0
 
-            # 单侧 MZ-score：只看“低于中位数”的幅度
-            # mz_low = (med - score) / std，越大说明越“低”
-            mz_low = (med - arr) / std
-            logging.info(f"[MedianGuard] One-sided MZ-score(low) of {tag}: %s" %
-                         [round(v, 4) for v in mz_low])
+            if use_two_sided_mz:
+                mz = np.abs(arr - med) / std
+                logging.info(f"[MedianGuard] Two-sided MZ-score of {tag}: %s" %
+                             [round(v, 4) for v in mz])
+                keep_mask = mz < lam
+            else:
+                # 单侧 MZ-score：只看“低于中位数”的幅度
+                mz_low = (med - arr) / std
+                logging.info(f"[MedianGuard] One-sided MZ-score(low) of {tag}: %s" %
+                             [round(v, 4) for v in mz_low])
+                # 保留条件：不过低 => mz_low < lam （或 score >= med - lam*std）
+                keep_mask = mz_low < lam
 
-            # 保留条件：不过低 => mz_low < lam （或 score >= med - lam*std）
-            keep_mask = mz_low < lam
             keep = set(np.argwhere(keep_mask).flatten().astype(int).tolist())
             return keep
 
