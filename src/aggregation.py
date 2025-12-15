@@ -70,6 +70,8 @@ class Aggregation():
             aggregated_updates = self.agg_median_guard_avg_align(agent_updates_dict, global_model, cur_global_params)
         elif self.args.aggr == 'median_guard_align2':
             aggregated_updates = self.agg_median_guard_avg_align2(agent_updates_dict, global_model, cur_global_params)
+        elif self.args.aggr == 'trust_clip':
+            aggregated_updates = self.agg_trust_clip(agent_updates_dict, cur_global_params)
         elif self.args.aggr == 'mpsa':
             aggregated_updates = self.agg_mpsa(agent_updates_dict, cur_global_params)
         elif self.args.aggr == 'mmetric':
@@ -688,6 +690,56 @@ class Aggregation():
             return baseline_update
 
         aggregated_update = self.agg_avg(selected_updates)
+        return aggregated_update
+
+    def agg_trust_clip(self, agent_updates_dict, flat_global_model):
+        """
+        Trust-Clip 防御：
+        1) 基于所有客户端更新的坐标中位数，作为可信方向 g_trust
+        2) 计算簇内基准幅度 R_base（更新 L2 范数的中位数）
+        3) 对每个客户端按与 g_trust 的余弦相似度自适应裁剪：
+           alpha_k = max(0, cos_sim)
+           R_k = R_base * (beta + (1 - beta) * alpha_k)
+           若 ||g|| > R_k，则按比例缩放到 R_k
+        4) 最终对裁剪后的更新做加权平均（按样本量）
+        """
+        if len(agent_updates_dict) == 0:
+            return torch.zeros_like(flat_global_model)
+
+        beta = float(getattr(self.args, "trust_clip_beta", 0.5))
+
+        client_ids = list(agent_updates_dict.keys())
+        local_updates = [agent_updates_dict[cid] for cid in client_ids]
+        stacked = torch.stack(local_updates, dim=0)
+
+        # 1) 可信方向：坐标中位数
+        g_trust = torch.median(stacked, dim=0).values
+
+        # 2) 基准幅度：范数中位数
+        norms = torch.norm(stacked, dim=1)
+        R_base = torch.median(norms).item()
+
+        clipped_updates = []
+        eps = 1e-12
+        for g in local_updates:
+            # 与可信方向的余弦相似度
+            cos_sim = torch.cosine_similarity(g.flatten(), g_trust.flatten(), dim=0).item()
+            alpha_k = max(0.0, cos_sim)
+
+            # 动态阈值
+            R_k = R_base * (beta + (1.0 - beta) * alpha_k)
+
+            g_norm = torch.norm(g).item()
+            if g_norm > R_k:
+                scaling = R_k / (g_norm + eps)
+                clipped_g = g * scaling
+            else:
+                clipped_g = g
+            clipped_updates.append(clipped_g)
+
+        # 加权平均
+        clipped_dict = {cid: clipped_updates[i] for i, cid in enumerate(client_ids)}
+        aggregated_update = self.agg_avg(clipped_dict)
         return aggregated_update
 
     def agg_mpsa(self, agent_updates_dict, flat_global_model):
