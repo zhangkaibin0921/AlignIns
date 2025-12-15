@@ -808,7 +808,7 @@ def setup_logging(args):
         root_logger.handlers.clear()
     
     logPath = "logs"
-    time_str = time.strftime("%Y-%m-%d-%H-%M")
+    time_str = time.strftime("%Y-%m-%d-%H-%M-%S")
 
     if args.non_iid:
         iid_str = 'noniid(%.1f)' % args.beta
@@ -831,7 +831,7 @@ def setup_logging(args):
     if not os.path.exists(file_path):
         os.makedirs(file_path)
 
-    backup_file = ['aggregation.py', 'federated.py', 'agent.py']
+    backup_file = ['aggregation.py', 'federated.py', 'agent.py', 'models.py']
 
     for file in backup_file:
         copyfile('./%s' % file, file_path + file)
