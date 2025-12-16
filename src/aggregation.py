@@ -690,21 +690,19 @@ class Aggregation():
         - 再用 MedianGuard 过滤客户端；如无客户端通过，回退到 baseline_update
         - 如果开启 trust_clip_after_mg2 开关，则对保留客户端再执行 trust_clip，否则直接 agg_avg
         """
-        baseline_update = self.agg_avg_alignment(agent_updates_dict)
-
         # 先用 avg_align2 得到筛选出的“良性”客户端更新集合
         selected_updates = self.agg_avg_alignment2(agent_updates_dict)
 
         if len(selected_updates) == 0:
-            logging.info("[MedianGuard+AvgAlign2] avg_align2 未筛出客户端，回退使用 avg_align 聚合结果")
-            return baseline_update
+            logging.info("[MedianGuard+AvgAlign2] avg_align2 未筛出客户端，返回零更新")
+            return torch.zeros_like(flat_global_model)
 
         selected_updates, fallback = self._median_guard_select(selected_updates, flat_global_model)
         if fallback is not None:
             return fallback
         if len(selected_updates) == 0:
-            logging.info("[MedianGuard+AvgAlign2] 过滤后无客户端通过，回退使用 avg_align 聚合结果")
-            return baseline_update
+            logging.info("[MedianGuard+AvgAlign2] 过滤后无客户端通过，返回零更新")
+            return torch.zeros_like(flat_global_model)
 
         use_trust_clip = bool(getattr(self.args, "trust_clip_after_mg2", False) )
         if use_trust_clip:
@@ -1434,6 +1432,26 @@ class Aggregation():
                     mixed_pairs.append(align_score)
                     mixed_cosine_pairs.append(cosine_sim)
 
+        # 日志统计与原 agg_avg_alignment 保持一致
+        def _log_stats(tag, values):
+            if len(values) == 0:
+                logging.info(f"[AvgAlign2][{tag}] 无对应客户端对")
+                return
+            arr = np.array(values, dtype=np.float64)
+            logging.info(
+                f"[AvgAlign2][{tag}] count={len(arr)}, mean={arr.mean():.4f}, std={arr.std():.4f}, "
+                f"min={arr.min():.4f}, max={arr.max():.4f}"
+            )
+
+        logging.info("[AvgAlign2] Pairwise sign-alignment matrix: %s", np.round(align_matrix, 3).tolist())
+        logging.info("[AvgAlign2] Pairwise cosine similarity matrix: %s", np.round(cosine_matrix, 3).tolist())
+        _log_stats("Benign-Benign (Align)", benign_pairs)
+        _log_stats("Benign-Malicious (Align)", mixed_pairs)
+        _log_stats("Malicious-Malicious (Align)", malicious_pairs)
+        _log_stats("Benign-Benign (Cosine)", benign_cosine_pairs)
+        _log_stats("Benign-Malicious (Cosine)", mixed_cosine_pairs)
+        _log_stats("Malicious-Malicious (Cosine)", malicious_cosine_pairs)
+
         # 归一化矩阵
         triu_indices = np.triu_indices_from(cosine_matrix, k=1)
         cosine_vals = cosine_matrix[triu_indices]
@@ -1465,6 +1483,9 @@ class Aggregation():
             for j in range(n_clients):
                 feature_matrix_normalized[i, j] = [cosine_matrix_normalized[i, j], align_matrix_normalized[i, j]]
 
+        logging.info("[AvgAlign2] Normalized pairwise sign-alignment matrix: %s", np.round(align_matrix_normalized, 3).tolist())
+        logging.info("[AvgAlign2] Normalized pairwise cosine similarity matrix: %s", np.round(cosine_matrix_normalized, 3).tolist())
+
         # 聚类与簇选择（沿用原逻辑，基于 Cohesion: Size * AvgPairwiseCosine）
         cluster_method = getattr(self.args, "align_cluster_method", "none").lower()
         selected_indices = list(range(n_clients))
@@ -1480,6 +1501,26 @@ class Aggregation():
                 benign_cnt = sum(1 for cid in member_ids if cid >= num_corrupt)
                 malicious_cnt = len(member_ids) - benign_cnt
                 majority_type = "Benign" if benign_cnt >= malicious_cnt else "Malicious"
+                logging.info(
+                    f"[AvgAlign2][{method_name}][cluster={cluster_id}] size={len(member_ids)} ({majority_type}), "
+                    f"benign={benign_cnt}, malicious={malicious_cnt}, members={member_ids}"
+                )
+                if len(member_idx) >= 2:
+                    sub_align = align_matrix_normalized[np.ix_(member_idx, member_idx)]
+                    tril = np.tril_indices_from(sub_align, k=-1)
+                    if len(tril[0]) > 0:
+                        align_vals_sub = sub_align[tril]
+                        logging.info(
+                            f"[AvgAlign2][{method_name}][cluster={cluster_id}] pairwise align mean={align_vals_sub.mean():.4f}, "
+                            f"std={align_vals_sub.std():.4f}, min={align_vals_sub.min():.4f}, max={align_vals_sub.max():.4f}"
+                        )
+                    sub_cosine = cosine_matrix_normalized[np.ix_(member_idx, member_idx)]
+                    if len(tril[0]) > 0:
+                        cosine_vals_sub = sub_cosine[tril]
+                        logging.info(
+                            f"[AvgAlign2][{method_name}][cluster={cluster_id}] pairwise cosine mean={cosine_vals_sub.mean():.4f}, "
+                            f"std={cosine_vals_sub.std():.4f}, min={cosine_vals_sub.min():.4f}, max={cosine_vals_sub.max():.4f}"
+                        )
                 stats.append((cluster_id, len(member_idx), majority_type, member_idx))
             return stats
 
@@ -1495,6 +1536,8 @@ class Aggregation():
                     align_score = feat_i[1]
                     dist = np.sqrt((1.0 - cosine_sim) ** 2 + (1.0 - align_score) ** 2)
                     feature_dist_matrix[i, j] = dist
+
+        logging.info("[AvgAlign2] Feature distance matrix: %s", np.round(feature_dist_matrix, 3).tolist())
 
         cluster_labels = None
         cluster_stats = []
