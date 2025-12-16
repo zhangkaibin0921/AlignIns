@@ -1665,8 +1665,12 @@ class Aggregation():
                     best_cluster = stat
 
             if best_cluster is not None:
-                _, _, _, chosen_member_idx = best_cluster
+                chosen_cluster_id, chosen_size, _, chosen_member_idx = best_cluster
                 selected_indices = np.array(chosen_member_idx, dtype=int).tolist()
+                logging.info(
+                    f"[AvgAlign2][Cluster] 选用 cluster={chosen_cluster_id} 进行聚合，"
+                    f"成员数={chosen_size}, avg_pairwise_cos={best_avg_cos:.4f}, score={best_score:.4f}"
+                )
             else:
                 logging.info("[AvgAlign2][Cluster] 未获得有效聚类结果，退化为使用全部客户端")
 
