@@ -671,7 +671,16 @@ class Aggregation():
         if len(selected_updates) == 0:
             return torch.zeros_like(flat_global_model)
         # 在过滤后的客户端集合上运行 avg_align（内部已包含加权聚合逻辑）
-        aggregated_update = self.agg_avg_alignment(selected_updates)
+        # aggregated_update = self.agg_avg_alignment(selected_updates)
+
+        selected_updates = self.agg_avg_alignment2(selected_updates)
+        use_trust_clip = bool(getattr(self.args, "trust_clip_after_mg2", False))
+        if use_trust_clip:
+            logging.info("[MedianGuard+AvgAlign2] 已开启 trust_clip_after_mg2，对过滤后的客户端执行 trust_clip")
+            aggregated_update = self.agg_trust_clip(selected_updates, global_model, flat_global_model)
+        else:
+            aggregated_update = self.agg_avg(selected_updates)
+
         return aggregated_update
 
     def agg_median_guard_avg_align2(self, agent_updates_dict, global_model, flat_global_model):
