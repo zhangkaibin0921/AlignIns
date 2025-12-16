@@ -679,6 +679,7 @@ class Aggregation():
         组合防御2：先运行 avg_align，再运行 MedianGuard 过滤。
         - 先用 avg_align 得到基线聚合结果 baseline_update
         - 再用 MedianGuard 过滤客户端；如无客户端通过，回退到 baseline_update
+        - 如果开启 trust_clip_after_mg2 开关，则对保留客户端再执行 trust_clip，否则直接 agg_avg
         """
         baseline_update = self.agg_avg_alignment(agent_updates_dict)
 
@@ -689,7 +690,13 @@ class Aggregation():
             logging.info("[MedianGuard+AvgAlign2] 过滤后无客户端通过，回退使用 avg_align 聚合结果")
             return baseline_update
 
-        aggregated_update = self.agg_avg(selected_updates)
+        use_trust_clip = bool(getattr(self.args, "trust_clip_after_mg2", False))
+        if use_trust_clip:
+            logging.info("[MedianGuard+AvgAlign2] 已开启 trust_clip_after_mg2，对过滤后的客户端执行 trust_clip")
+            aggregated_update = self.agg_trust_clip(selected_updates, global_model, flat_global_model)
+        else:
+            aggregated_update = self.agg_avg(selected_updates)
+
         return aggregated_update
 
     def agg_trust_clip(self, agent_updates_dict, global_model, flat_global_model):
