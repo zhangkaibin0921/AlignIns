@@ -71,7 +71,7 @@ class Aggregation():
         elif self.args.aggr == 'median_guard_align2':
             aggregated_updates = self.agg_median_guard_avg_align2(agent_updates_dict, global_model, cur_global_params)
         elif self.args.aggr == 'trust_clip':
-            aggregated_updates = self.agg_trust_clip(agent_updates_dict, cur_global_params)
+            aggregated_updates = self.agg_trust_clip(agent_updates_dict, global_model, cur_global_params)
         elif self.args.aggr == 'mpsa':
             aggregated_updates = self.agg_mpsa(agent_updates_dict, cur_global_params)
         elif self.args.aggr == 'mmetric':
@@ -692,16 +692,17 @@ class Aggregation():
         aggregated_update = self.agg_avg(selected_updates)
         return aggregated_update
 
-    def agg_trust_clip(self, agent_updates_dict, flat_global_model):
+    def agg_trust_clip(self, agent_updates_dict, global_model, flat_global_model):
         """
         Trust-Clip 防御：
-        1) 基于所有客户端更新的坐标中位数，作为可信方向 g_trust
-        2) 计算簇内基准幅度 R_base（更新 L2 范数的中位数）
-        3) 对每个客户端按与 g_trust 的余弦相似度自适应裁剪：
+        分层自适应裁剪，防止攻击集中于某一层被全局范数掩盖：
+        1) 对每一层计算可信方向 g_trust_layer（该层更新的坐标中位数）
+        2) 对每一层计算基准幅度 R_base_layer（该层更新 L2 范数的中位数）
+        3) 对每个客户端、每一层按与 g_trust_layer 的余弦相似度自适应裁剪：
            alpha_k = max(0, cos_sim)
-           R_k = R_base * (beta + (1 - beta) * alpha_k)
-           若 ||g|| > R_k，则按比例缩放到 R_k
-        4) 最终对裁剪后的更新做加权平均（按样本量）
+           R_k = R_base_layer * (beta + (1 - beta) * alpha_k)
+           若 ||g_layer|| > R_k，则按比例缩放到 R_k
+        4) 将各层裁剪后拼回向量，再按样本量加权平均
         """
         if len(agent_updates_dict) == 0:
             return torch.zeros_like(flat_global_model)
@@ -710,31 +711,57 @@ class Aggregation():
 
         client_ids = list(agent_updates_dict.keys())
         local_updates = [agent_updates_dict[cid] for cid in client_ids]
-        stacked = torch.stack(local_updates, dim=0)
+        stacked = torch.stack(local_updates, dim=0)  # [N, D]
 
-        # 1) 可信方向：坐标中位数
-        g_trust = torch.median(stacked, dim=0).values
+        # 构建层范围
+        state_dict = global_model.state_dict()
+        layer_ranges = []
+        start = 0
+        for name, param in state_dict.items():
+            length = param.numel()
+            layer_ranges.append((name, start, start + length))
+            start += length
 
-        # 2) 基准幅度：范数中位数
-        norms = torch.norm(stacked, dim=1)
-        R_base = torch.median(norms).item()
-
-        clipped_updates = []
         eps = 1e-12
-        for g in local_updates:
-            # 与可信方向的余弦相似度
-            cos_sim = torch.cosine_similarity(g.flatten(), g_trust.flatten(), dim=0).item()
-            alpha_k = max(0.0, cos_sim)
 
-            # 动态阈值
-            R_k = R_base * (beta + (1.0 - beta) * alpha_k)
+        # 预计算每层的可信方向与基准幅度
+        layer_trust = {}
+        layer_rbase = {}
+        for name, s, e in layer_ranges:
+            layer_stack = stacked[:, s:e]  # [N, layer_dim]
+            g_trust_layer = torch.median(layer_stack, dim=0).values
+            norms_layer = torch.norm(layer_stack, dim=1)
+            r_base_layer = torch.median(norms_layer).item()
+            layer_trust[name] = g_trust_layer
+            layer_rbase[name] = r_base_layer
 
-            g_norm = torch.norm(g).item()
-            if g_norm > R_k:
-                scaling = R_k / (g_norm + eps)
-                clipped_g = g * scaling
-            else:
-                clipped_g = g
+        # 对每个客户端分层裁剪
+        clipped_updates = []
+        for idx in range(len(local_updates)):
+            g = local_updates[idx]
+            clipped_chunks = []
+            for name, s, e in layer_ranges:
+                g_layer = g[s:e]
+                trust_layer = layer_trust[name]
+                r_base_layer = layer_rbase[name]
+
+                # 余弦相似度
+                denom = (torch.norm(g_layer) * torch.norm(trust_layer) + eps)
+                cos_sim = torch.dot(g_layer, trust_layer).item() / denom
+                alpha_k = max(0.0, cos_sim)
+
+                # 动态阈值
+                R_k = r_base_layer * (beta + (1.0 - beta) * alpha_k)
+
+                g_norm = torch.norm(g_layer).item()
+                if g_norm > R_k and R_k > 0:
+                    scaling = R_k / (g_norm + eps)
+                    clipped_layer = g_layer * scaling
+                else:
+                    clipped_layer = g_layer
+                clipped_chunks.append(clipped_layer)
+
+            clipped_g = torch.cat(clipped_chunks)
             clipped_updates.append(clipped_g)
 
         # 加权平均
