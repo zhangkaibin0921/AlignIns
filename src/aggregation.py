@@ -683,14 +683,21 @@ class Aggregation():
         """
         baseline_update = self.agg_avg_alignment(agent_updates_dict)
 
-        selected_updates, fallback = self._median_guard_select(agent_updates_dict, flat_global_model)
+        # 先用 avg_align2 得到筛选出的“良性”客户端更新集合
+        selected_updates = self.agg_avg_alignment2(agent_updates_dict)
+
+        if len(selected_updates) == 0:
+            logging.info("[MedianGuard+AvgAlign2] avg_align2 未筛出客户端，回退使用 avg_align 聚合结果")
+            return baseline_update
+
+        selected_updates, fallback = self._median_guard_select(selected_updates, flat_global_model)
         if fallback is not None:
             return fallback
         if len(selected_updates) == 0:
             logging.info("[MedianGuard+AvgAlign2] 过滤后无客户端通过，回退使用 avg_align 聚合结果")
             return baseline_update
 
-        use_trust_clip = bool(getattr(self.args, "trust_clip_after_mg2", False))
+        use_trust_clip = bool(getattr(self.args, "trust_clip_after_mg2", False) )
         if use_trust_clip:
             logging.info("[MedianGuard+AvgAlign2] 已开启 trust_clip_after_mg2，对过滤后的客户端执行 trust_clip")
             aggregated_update = self.agg_trust_clip(selected_updates, global_model, flat_global_model)
@@ -1336,6 +1343,284 @@ class Aggregation():
 
         return aggregated_update
 
+    def agg_avg_alignment2(self, agent_updates_dict):
+        """
+        与 agg_avg_alignment 相同的诊断与筛选过程，但不做最终聚合，
+        而是返回筛选出的“良性”客户端更新字典，供其他流程复用。
+        """
+        if len(agent_updates_dict) == 0:
+            return {}
+
+        client_ids = list(agent_updates_dict.keys())
+        local_updates = [agent_updates_dict[cid] for cid in client_ids]
+        stacked = torch.stack(local_updates, dim=0)
+        n_clients, dim = stacked.shape
+
+        topk_ratio = float(getattr(self.args, "avg_align_topk_ratio", 0.3))
+        topk_dim = max(1, int(dim * topk_ratio))
+        abs_updates = torch.abs(stacked)
+        topk_indices = torch.topk(abs_updates, k=topk_dim, dim=1).indices
+        topk_mask = torch.zeros_like(stacked, dtype=torch.bool)
+        topk_mask.scatter_(1, topk_indices, True)
+
+        sign_updates = torch.sign(stacked)
+        num_corrupt = int(getattr(self.args, "num_corrupt", 0))
+        eps = 1e-8
+
+        # 计算对齐矩阵与特征（与 agg_avg_alignment 相同）
+        align_matrix = np.zeros((n_clients, n_clients), dtype=np.float64)
+        cosine_matrix = np.zeros((n_clients, n_clients), dtype=np.float64)
+        feature_matrix = np.zeros((n_clients, n_clients, 2), dtype=np.float64)
+
+        benign_pairs = []
+        mixed_pairs = []
+        malicious_pairs = []
+        benign_cosine_pairs = []
+        mixed_cosine_pairs = []
+        malicious_cosine_pairs = []
+        gradient_ratio_list = []
+
+        for i in range(n_clients):
+            for j in range(i, n_clients):
+                if i == j:
+                    align_matrix[i, j] = 1.0
+                    cosine_matrix[i, j] = 0.0
+                    feature_matrix[i, j] = [0.0, 1.0]
+                    continue
+
+                common_mask = topk_mask[i] & topk_mask[j]
+                intersect_count = int(common_mask.sum().item())
+                gradient_ratio = intersect_count / dim if dim > 0 else 0.0
+                gradient_ratio_list.append(gradient_ratio)
+
+                if intersect_count == 0:
+                    align_score = 0.0
+                    cosine_sim = 0.0
+                else:
+                    same_sign = torch.sum(sign_updates[i][common_mask] == sign_updates[j][common_mask]).item()
+                    align_score = float(same_sign / intersect_count)
+
+                    vec_i = stacked[i][common_mask]
+                    vec_j = stacked[j][common_mask]
+                    norm_i = torch.norm(vec_i).item()
+                    norm_j = torch.norm(vec_j).item()
+                    if norm_i > eps and norm_j > eps:
+                        cosine_sim = float(torch.dot(vec_i, vec_j).item() / (norm_i * norm_j))
+                    else:
+                        cosine_sim = 0.0
+
+                align_matrix[i, j] = align_matrix[j, i] = align_score
+                cosine_matrix[i, j] = cosine_matrix[j, i] = cosine_sim
+                feature_matrix[i, j] = feature_matrix[j, i] = [cosine_sim, align_score]
+
+                id_i = client_ids[i]
+                id_j = client_ids[j]
+                if id_i >= num_corrupt and id_j >= num_corrupt:
+                    benign_pairs.append(align_score)
+                    benign_cosine_pairs.append(cosine_sim)
+                elif id_i < num_corrupt and id_j < num_corrupt:
+                    malicious_pairs.append(align_score)
+                    malicious_cosine_pairs.append(cosine_sim)
+                else:
+                    mixed_pairs.append(align_score)
+                    mixed_cosine_pairs.append(cosine_sim)
+
+        # 归一化矩阵
+        triu_indices = np.triu_indices_from(cosine_matrix, k=1)
+        cosine_vals = cosine_matrix[triu_indices]
+        align_vals = align_matrix[triu_indices]
+
+        eps = 1e-12
+        if len(cosine_vals) > 0:
+            cmin, cmax = np.min(cosine_vals), np.max(cosine_vals)
+        else:
+            cmin, cmax = 0.0, 1.0
+        if abs(cmax - cmin) < eps:
+            cosine_matrix_normalized = cosine_matrix.copy()
+        else:
+            cosine_matrix_normalized = (cosine_matrix - cmin) / (cmax - cmin)
+            np.fill_diagonal(cosine_matrix_normalized, 0.0)
+
+        if len(align_vals) > 0:
+            amin, amax = np.min(align_vals), np.max(align_vals)
+        else:
+            amin, amax = 0.0, 1.0
+        if abs(amax - amin) < eps:
+            align_matrix_normalized = align_matrix.copy()
+        else:
+            align_matrix_normalized = (align_matrix - amin) / (amax - amin)
+            np.fill_diagonal(align_matrix_normalized, 1.0)
+
+        feature_matrix_normalized = np.zeros((n_clients, n_clients, 2), dtype=np.float64)
+        for i in range(n_clients):
+            for j in range(n_clients):
+                feature_matrix_normalized[i, j] = [cosine_matrix_normalized[i, j], align_matrix_normalized[i, j]]
+
+        # 聚类与簇选择（沿用原逻辑，基于 Cohesion: Size * AvgPairwiseCosine）
+        cluster_method = getattr(self.args, "align_cluster_method", "none").lower()
+        selected_indices = list(range(n_clients))
+
+        def _report_clusters(labels, method_name):
+            unique_labels = sorted(set(labels))
+            stats = []
+            for cluster_id in unique_labels:
+                member_idx = np.where(labels == cluster_id)[0]
+                if len(member_idx) == 0:
+                    continue
+                member_ids = [client_ids[idx] for idx in member_idx]
+                benign_cnt = sum(1 for cid in member_ids if cid >= num_corrupt)
+                malicious_cnt = len(member_ids) - benign_cnt
+                majority_type = "Benign" if benign_cnt >= malicious_cnt else "Malicious"
+                stats.append((cluster_id, len(member_idx), majority_type, member_idx))
+            return stats
+
+        # 计算基于二维特征的距离矩阵
+        feature_dist_matrix = np.zeros((n_clients, n_clients), dtype=np.float64)
+        for i in range(n_clients):
+            for j in range(n_clients):
+                if i == j:
+                    feature_dist_matrix[i, j] = 0.0
+                else:
+                    feat_i = feature_matrix_normalized[i, j]
+                    cosine_sim = feat_i[0]
+                    align_score = feat_i[1]
+                    dist = np.sqrt((1.0 - cosine_sim) ** 2 + (1.0 - align_score) ** 2)
+                    feature_dist_matrix[i, j] = dist
+
+        cluster_labels = None
+        cluster_stats = []
+        if cluster_method != "none":
+            if n_clients < 2:
+                logging.info("[AvgAlign2][Cluster] 客户端数量不足，跳过聚类（n_clients=%d）", n_clients)
+            else:
+                if cluster_method == "kmeans":
+                    if KMeans is not None:
+                        cluster_k = int(getattr(self.args, "align_cluster_k", 2))
+                        cluster_k = max(1, min(cluster_k, n_clients))
+                        if cluster_k == 1:
+                            cluster_labels = np.zeros(n_clients, dtype=int)
+                        else:
+                            client_features = np.zeros((n_clients, 2), dtype=np.float64)
+                            for i in range(n_clients):
+                                mask = np.arange(n_clients) != i
+                                if mask.any():
+                                    client_features[i] = np.mean(feature_matrix_normalized[i, mask, :], axis=0)
+                                else:
+                                    client_features[i] = [1.0, 1.0]
+                            try:
+                                kmeans = KMeans(n_clusters=cluster_k, n_init="auto", random_state=42)
+                            except TypeError:
+                                kmeans = KMeans(n_clusters=cluster_k, n_init=10, random_state=42)
+                            cluster_labels = kmeans.fit_predict(client_features)
+                    else:
+                        logging.warning("[AvgAlign2][KMeans] sklearn 未安装，无法执行 KMeans 聚类")
+                elif cluster_method == "spectral":
+                    if SpectralClustering is not None:
+                        cluster_k = int(getattr(self.args, "align_spectral_clusters", 2))
+                        cluster_k = max(2, min(cluster_k, n_clients))
+                        similarity_matrix = 1.0 / (1.0 + feature_dist_matrix)
+                        np.fill_diagonal(similarity_matrix, 1.0)
+                        spectral = SpectralClustering(
+                            n_clusters=cluster_k, affinity="precomputed", assign_labels="kmeans", random_state=42
+                        )
+                        cluster_labels = spectral.fit_predict(similarity_matrix)
+                    else:
+                        logging.warning("[AvgAlign2][Spectral] sklearn 未安装，无法执行谱聚类")
+                elif cluster_method == "dbscan":
+                    if DBSCAN is not None:
+                        eps_db = float(getattr(self.args, "align_dbscan_eps", 0.3))
+                        min_samples = int(getattr(self.args, "align_dbscan_min_samples", 2))
+                        dbscan = DBSCAN(eps=eps_db, min_samples=min_samples, metric="precomputed")
+                        cluster_labels = dbscan.fit_predict(feature_dist_matrix)
+                    else:
+                        logging.warning("[AvgAlign2][DBSCAN] sklearn 未安装，无法执行 DBSCAN 聚类")
+                elif cluster_method == "hdbscan":
+                    if hdbscan is not None:
+                        clusterer = hdbscan.HDBSCAN(
+                            metric="precomputed",
+                            min_cluster_size=max(2, n_clients // 2 + 1),
+                            min_samples=1,
+                            allow_single_cluster=True,
+                        )
+                        cluster_labels = clusterer.fit(feature_dist_matrix).labels_
+                    else:
+                        logging.warning("[AvgAlign2][HDBSCAN] hdbscan 未安装，无法执行 HDBSCAN 聚类")
+                elif cluster_method == "finch":
+                    if finch is not None:
+                        try:
+                            np.fill_diagonal(feature_dist_matrix, 0.0)
+                            try:
+                                c, num_clust, req_c = finch.FINCH(
+                                    feature_dist_matrix,
+                                    initial_rank=None,
+                                    req_clust=None,
+                                    distance='precomputed',
+                                    ensure_early_termination=True,
+                                    verbose=False
+                                )
+                            except (TypeError, ValueError):
+                                client_features = np.zeros((n_clients, 2), dtype=np.float64)
+                                for i in range(n_clients):
+                                    mask = np.arange(n_clients) != i
+                                    if mask.any():
+                                        client_features[i] = np.mean(feature_matrix_normalized[i, mask, :], axis=0)
+                                    else:
+                                        client_features[i] = [1.0, 1.0]
+                                c, num_clust, req_c = finch.FINCH(
+                                    client_features,
+                                    initial_rank=None,
+                                    req_clust=None,
+                                    distance='euclidean',
+                                    ensure_early_termination=True,
+                                    verbose=False
+                                )
+                            if c is not None and c.shape[1] > 0:
+                                cluster_labels = c[:, -1].astype(int)
+                            else:
+                                cluster_labels = None
+                        except Exception as e:
+                            logging.warning(f"[AvgAlign2][FINCH] FINCH 聚类执行失败: {e}")
+                            cluster_labels = None
+                    else:
+                        logging.warning("[AvgAlign2][FINCH] finch 未安装，无法执行 FINCH 聚类")
+
+        if cluster_labels is not None:
+            cluster_stats = _report_clusters(cluster_labels, cluster_method.upper())
+
+            best_cluster = None
+            best_score = None
+            best_avg_cos = None
+
+            for stat in cluster_stats:
+                cluster_id, size, majority_type, member_idx = stat
+                if size == 0:
+                    continue
+
+                member_tensor_idx = np.array(member_idx, dtype=int)
+                sub_cos = cosine_matrix_normalized[np.ix_(member_tensor_idx, member_tensor_idx)]
+                tril = np.tril_indices_from(sub_cos, k=-1)
+                if len(tril[0]) > 0:
+                    pair_vals = sub_cos[tril]
+                    avg_pair_cos = float(pair_vals.mean())
+                else:
+                    avg_pair_cos = 1.0
+
+                score = size * (1.0 + avg_pair_cos)  # 与主版本一致
+
+                if best_score is None or score > best_score:
+                    best_score = score
+                    best_avg_cos = avg_pair_cos
+                    best_cluster = stat
+
+            if best_cluster is not None:
+                _, _, _, chosen_member_idx = best_cluster
+                selected_indices = np.array(chosen_member_idx, dtype=int).tolist()
+            else:
+                logging.info("[AvgAlign2][Cluster] 未获得有效聚类结果，退化为使用全部客户端")
+
+        selected_client_ids = [client_ids[idx] for idx in selected_indices]
+        selected_updates = {cid: agent_updates_dict[cid] for cid in selected_client_ids}
+        return selected_updates
     def agg_median(self, agent_updates_dict):
         """Coordinate-wise median aggregation."""
         if len(agent_updates_dict) == 0:
