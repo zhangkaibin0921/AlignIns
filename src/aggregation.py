@@ -727,25 +727,26 @@ class Aggregation():
         1) 对每一层计算可信方向 g_trust_layer（该层更新的坐标中位数）
         2) 对每一层计算基准幅度 R_base_layer（该层更新 L2 范数的中位数）
         3) 对每个客户端、每一层按与 g_trust_layer 的余弦相似度自适应裁剪：
-           alpha_k = max(0, cos_sim)
-           R_k = R_base_layer * (beta + (1 - beta) * alpha_k)
-           若 ||g_layer|| > R_k，则按比例缩放到 R_k
+        - 保留余弦相似度正负值（-1~1）
+        - 阈值范围固定为 0.5~1.5 倍 r_base_layer：
+            cos_sim=1（同向）→ 1.5倍阈值，cos_sim=-1（反向）→ 0.5倍阈值
+        - 若 ||g_layer|| > R_k，则按比例缩放到 R_k
         4) 将各层裁剪后拼回向量，再按样本量加权平均
         """
         if len(agent_updates_dict) == 0:
             return torch.zeros_like(flat_global_model)
 
-        beta = float(getattr(self.args, "trust_clip_beta", 0.5))
-
         client_ids = list(agent_updates_dict.keys())
         local_updates = [agent_updates_dict[cid] for cid in client_ids]
         stacked = torch.stack(local_updates, dim=0)  # [N, D]
 
-        # 构建层范围
-        state_dict = global_model.state_dict()
+                # 构建层范围 (修正版：只取参与训练的参数)
         layer_ranges = []
         start = 0
-        for name, param in state_dict.items():
+        # 使用 named_parameters 确保顺序和扁平化向量一致，且只包含权重/偏置
+        for name, param in global_model.named_parameters():
+            if not param.requires_grad:
+                continue
             length = param.numel()
             layer_ranges.append((name, start, start + length))
             start += length
@@ -773,17 +774,22 @@ class Aggregation():
                 trust_layer = layer_trust[name]
                 r_base_layer = layer_rbase[name]
 
-                # 余弦相似度
-                denom = (torch.norm(g_layer) * torch.norm(trust_layer) + eps)
+                # 余弦相似度（保留正负值，-1~1）
+                g_norm = torch.norm(g_layer)
+                trust_norm = torch.norm(trust_layer)
+                denom = (g_norm * trust_norm + eps)
                 cos_sim = torch.dot(g_layer, trust_layer).item() / denom
-                alpha_k = max(0.0, cos_sim)
 
-                # 动态阈值
-                R_k = r_base_layer * (beta + (1.0 - beta) * alpha_k)
+                # 动态阈值：固定范围 0.5~1.5 倍 r_base_layer（去掉beta，直接写死）
+                # 公式推导：1 + 0.5*cos_sim → cos_sim=1→1.5，cos_sim=-1→0.5
+                R_k = r_base_layer * (1 + 0.5 * cos_sim)
 
-                g_norm = torch.norm(g_layer).item()
-                if g_norm > R_k and R_k > 0:
-                    scaling = R_k / (g_norm + eps)
+                # 确保R_k非负（极端情况防护，避免0阈值导致除以0）
+                R_k = max(R_k, 1e-8)
+
+                # 裁剪逻辑
+                if g_norm.item() > R_k:
+                    scaling = R_k / (g_norm.item() + eps)
                     clipped_layer = g_layer * scaling
                 else:
                     clipped_layer = g_layer
