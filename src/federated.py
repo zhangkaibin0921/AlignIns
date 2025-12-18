@@ -161,6 +161,7 @@ if __name__ == "__main__":
     parser.add_argument("--median_guard_two_sided", action="store_true", default=False, help="use two-sided MZ filtering in median_guard (filter too high or too low)")
     parser.add_argument("--trust_clip_beta", type=float, default=0.5, help="baseline coefficient beta in trust_clip (default 0.5)")
     parser.add_argument("--trust_clip_after_mg2", action="store_true", default=False, help="apply trust_clip after median_guard_avg_align2 filtering instead of plain agg_avg")
+    parser.add_argument("--disable_median_guard_in_mg2", action="store_true", default=False, help="disable MedianGuard filtering in median_guard_avg_align2 (default: enabled)")
     
     # ScopeMM aggregation method parameters
     parser.add_argument("--eps", type=float, default=1e-12, help="epsilon for numerical stability in ScopeMM")

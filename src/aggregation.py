@@ -697,12 +697,19 @@ class Aggregation():
             logging.info("[MedianGuard+AvgAlign2] avg_align2 未筛出客户端，返回零更新")
             return torch.zeros_like(flat_global_model)
 
-        selected_updates, fallback = self._median_guard_select(selected_updates, flat_global_model)
-        if fallback is not None:
-            return fallback
-        if len(selected_updates) == 0:
-            logging.info("[MedianGuard+AvgAlign2] 过滤后无客户端通过，返回零更新")
-            return torch.zeros_like(flat_global_model)
+        # 开关：是否调用 MedianGuard 过滤（默认打开）
+        disable_median_guard = bool(getattr(self.args, "disable_median_guard_in_mg2", False))
+        use_median_guard = not disable_median_guard
+        if use_median_guard:
+            logging.info("[MedianGuard+AvgAlign2] 已开启 MedianGuard 过滤")
+            selected_updates, fallback = self._median_guard_select(selected_updates, flat_global_model)
+            if fallback is not None:
+                return fallback
+            if len(selected_updates) == 0:
+                logging.info("[MedianGuard+AvgAlign2] MedianGuard 过滤后无客户端通过，返回零更新")
+                return torch.zeros_like(flat_global_model)
+        else:
+            logging.info("[MedianGuard+AvgAlign2] 已关闭 MedianGuard 过滤，直接使用 avg_align2 的结果")
 
         use_trust_clip = bool(getattr(self.args, "trust_clip_after_mg2", False) )
         if use_trust_clip:
@@ -1011,6 +1018,14 @@ class Aggregation():
         _log_stats("Benign-Benign (Cosine)", benign_cosine_pairs)
         _log_stats("Benign-Malicious (Cosine)", mixed_cosine_pairs)
         _log_stats("Malicious-Malicious (Cosine)", malicious_cosine_pairs)
+
+        if len(gradient_ratio_list) > 0:
+            ratio_arr = np.array(gradient_ratio_list, dtype=np.float64)
+            logging.info(
+                f"[AvgAlign2] 选择的梯度占全部梯度的比例统计: "
+                f"mean={ratio_arr.mean():.6f}, std={ratio_arr.std():.6f}, "
+                f"min={ratio_arr.min():.6f}, max={ratio_arr.max():.6f}, median={np.median(ratio_arr):.6f}"
+            )
 
 
          # Min-Max normalization of the feature matrix (二维特征归一化)
@@ -1485,6 +1500,36 @@ class Aggregation():
 
         logging.info("[AvgAlign2] Normalized pairwise sign-alignment matrix: %s", np.round(align_matrix_normalized, 3).tolist())
         logging.info("[AvgAlign2] Normalized pairwise cosine similarity matrix: %s", np.round(cosine_matrix_normalized, 3).tolist())
+
+        # 归一化后的分组统计
+        benign_pairs_normalized = []
+        mixed_pairs_normalized = []
+        malicious_pairs_normalized = []
+        benign_cosine_normalized = []
+        mixed_cosine_normalized = []
+        malicious_cosine_normalized = []
+        for i in range(n_clients):
+            for j in range(i + 1, n_clients):
+                id_i = client_ids[i]
+                id_j = client_ids[j]
+                normalized_align = align_matrix_normalized[i, j]
+                normalized_cosine = cosine_matrix_normalized[i, j]
+                if id_i >= num_corrupt and id_j >= num_corrupt:
+                    benign_pairs_normalized.append(normalized_align)
+                    benign_cosine_normalized.append(normalized_cosine)
+                elif id_i < num_corrupt and id_j < num_corrupt:
+                    malicious_pairs_normalized.append(normalized_align)
+                    malicious_cosine_normalized.append(normalized_cosine)
+                else:
+                    mixed_pairs_normalized.append(normalized_align)
+                    mixed_cosine_normalized.append(normalized_cosine)
+
+        _log_stats("Benign-Benign (Align Normalized)", benign_pairs_normalized)
+        _log_stats("Benign-Malicious (Align Normalized)", mixed_pairs_normalized)
+        _log_stats("Malicious-Malicious (Align Normalized)", malicious_pairs_normalized)
+        _log_stats("Benign-Benign (Cosine Normalized)", benign_cosine_normalized)
+        _log_stats("Benign-Malicious (Cosine Normalized)", mixed_cosine_normalized)
+        _log_stats("Malicious-Malicious (Cosine Normalized)", malicious_cosine_normalized)
 
         # 聚类与簇选择（沿用原逻辑，基于 Cohesion: Size * AvgPairwiseCosine）
         cluster_method = getattr(self.args, "align_cluster_method", "none").lower()
