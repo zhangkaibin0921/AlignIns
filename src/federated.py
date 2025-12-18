@@ -114,6 +114,7 @@ if __name__ == "__main__":
         default="avg",
         choices=[
             "avg",
+            "avg_xing",
             "median",
             "avg_align",
             "alignins",

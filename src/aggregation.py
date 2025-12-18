@@ -56,6 +56,8 @@ class Aggregation():
             [global_model.state_dict()[name] for name in global_model.state_dict()]).detach()
         if self.args.aggr=='avg' or self.args.aggr == 'rlr' or self.args.aggr == 'lockdown':          
             aggregated_updates = self.agg_avg(agent_updates_dict)
+        elif self.args.aggr == 'avg_xing':
+            aggregated_updates = self.agg_avg_xing(agent_updates_dict)
         elif self.args.aggr == 'median':
             aggregated_updates = self.agg_median(agent_updates_dict)
         elif self.args.aggr == 'avg_align':
@@ -903,6 +905,28 @@ class Aggregation():
             sm_updates +=  n_agent_data * update
             total_data += n_agent_data
         return  sm_updates / total_data
+
+    def agg_avg_xing(self, agent_updates_dict):
+        """
+        仅对“良性”客户端的梯度做 FedAvg 聚合的封装。
+        入参仍为完整的 agent_updates_dict，但根据 _id 与 num_corrupt 自动区分良性/恶意：
+          - _id < num_corrupt  → 恶意客户端
+          - _id >= num_corrupt → 良性客户端
+        """
+        if len(agent_updates_dict) == 0:
+            return torch.zeros(self.n_params, device=self.args.device)
+
+        benign_updates_dict = {}
+        for _id, update in agent_updates_dict.items():
+            if _id >= self.args.num_corrupt:  # 视为良性
+                benign_updates_dict[_id] = update
+
+        if len(benign_updates_dict) == 0:
+            # 无良性客户端时返回零更新
+            first_update = next(iter(agent_updates_dict.values()))
+            return torch.zeros_like(first_update)
+
+        return self.agg_avg(benign_updates_dict)
 
     def agg_avg_alignment(self, agent_updates_dict):
         """
