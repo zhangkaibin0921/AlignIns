@@ -117,6 +117,7 @@ if __name__ == "__main__":
             "avg_xing",
             "median",
             "avg_align",
+            "avg_align3",
             "alignins",
             "rlr",
             "mkrum",
@@ -159,6 +160,8 @@ if __name__ == "__main__":
     parser.add_argument("--alignins_layer_norm", action="store_true", default=False, help="enable layer-wise normalization for AlignIns aggregation")
     parser.add_argument("--tda_use_median_anchor", action="store_true", default=False, help="use median aggregation as TDA anchor (False=use global model, True=use median)")
     parser.add_argument("--avg_align_topk_ratio", type=float, default=0.3, help="top-k ratio used in avg_align sign-alignment (default 0.3)")
+    parser.add_argument("--avg_align3_use_align", type=int, default=1, choices=[0, 1], help="whether to use sign-alignment metric in avg_align3 (1=yes, 0=no)")
+    parser.add_argument("--avg_align3_use_cosine", type=int, default=1, choices=[0, 1], help="whether to use cosine similarity metric in avg_align3 (1=yes, 0=no)")
     parser.add_argument("--median_guard_two_sided", action="store_true", default=False, help="use two-sided MZ filtering in median_guard (filter too high or too low)")
     parser.add_argument("--trust_clip_beta", type=float, default=0.5, help="baseline coefficient beta in trust_clip (default 0.5)")
     parser.add_argument("--trust_clip_after_mg2", action="store_true", default=False, help="apply trust_clip after median_guard_avg_align2 filtering instead of plain agg_avg")
