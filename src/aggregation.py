@@ -555,6 +555,11 @@ class Aggregation():
         lambda_c = float(getattr(self.args, "lambda_c", 1.0))
         eps = float(getattr(self.args, "eps", 1e-12))
 
+        use_mpsa = bool(getattr(self.args, "median_guard_use_mpsa", True))
+        use_tda = bool(getattr(self.args, "median_guard_use_tda", True))
+        if (not use_mpsa) and (not use_tda):
+            raise ValueError("At least one of median_guard_use_mpsa/median_guard_use_tda must be enabled")
+
         major_sign = torch.sign(tmp)
         tmp_norm = torch.norm(tmp).item()
         if tmp_norm <= eps:
@@ -573,22 +578,26 @@ class Aggregation():
             # Top-k 重要坐标（按绝对值）
             _, topk_idx = torch.topk(torch.abs(vec), k=topk_dim)
 
-            # MPSA-like：与 tmp 主符号的一致性
-            sign_vec = torch.sign(vec[topk_idx])
-            agree = torch.sum(sign_vec == major_sign[topk_idx]).item()
-            mpsa = agree / float(topk_dim)
-            mpsa_scores.append(mpsa)
+            if use_mpsa:
+                # MPSA-like：与 tmp 主符号的一致性
+                sign_vec = torch.sign(vec[topk_idx])
+                agree = torch.sum(sign_vec == major_sign[topk_idx]).item()
+                mpsa = agree / float(topk_dim)
+                mpsa_scores.append(mpsa)
 
-            # TDA-like：与 tmp 的余弦相似度
-            vec_norm = torch.norm(vec).item()
-            if vec_norm > eps:
-                tda = float(torch.dot(vec, tmp).item() / (vec_norm * tmp_norm))
-            else:
-                tda = 0.0
-            tda_scores.append(tda)
+            if use_tda:
+                # TDA-like：与 tmp 的余弦相似度
+                vec_norm = torch.norm(vec).item()
+                if vec_norm > eps:
+                    tda = float(torch.dot(vec, tmp).item() / (vec_norm * tmp_norm))
+                else:
+                    tda = 0.0
+                tda_scores.append(tda)
 
-        logging.info('[MedianGuard] MPSA-like scores: %s' % [round(x, 4) for x in mpsa_scores])
-        logging.info('[MedianGuard] TDA-like scores: %s' % [round(x, 4) for x in tda_scores])
+        if use_mpsa:
+            logging.info('[MedianGuard] MPSA-like scores: %s' % [round(x, 4) for x in mpsa_scores])
+        if use_tda:
+            logging.info('[MedianGuard] TDA-like scores: %s' % [round(x, 4) for x in tda_scores])
 
         # 3) MZ-score 过滤
         use_two_sided_mz = bool(getattr(self.args, "median_guard_two_sided", False))
@@ -623,8 +632,14 @@ class Aggregation():
             keep = set(np.argwhere(keep_mask).flatten().astype(int).tolist())
             return keep
 
-        keep_mpsa = _mz_filter(mpsa_scores, lambda_s, "MPSA")
-        keep_tda = _mz_filter(tda_scores, lambda_c, "TDA")
+        if use_mpsa:
+            keep_mpsa = _mz_filter(mpsa_scores, lambda_s, "MPSA")
+        else:
+            keep_mpsa = set(range(num_clients))
+        if use_tda:
+            keep_tda = _mz_filter(tda_scores, lambda_c, "TDA")
+        else:
+            keep_tda = set(range(num_clients))
 
         # 交集作为最终保留的客户端索引（相对于 client_ids 的索引）
         keep_idx_set = keep_mpsa.intersection(keep_tda)
