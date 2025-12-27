@@ -132,6 +132,7 @@ if __name__ == "__main__":
             "median_guard",
             "median_guard_align",
             "median_guard_align2",
+            "median_guard_align3",
             "tda_only",
             "trust_clip"
         ],

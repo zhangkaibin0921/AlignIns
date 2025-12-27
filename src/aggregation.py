@@ -84,6 +84,8 @@ class Aggregation():
             aggregated_updates = self.agg_median_guard_avg_align(agent_updates_dict, global_model, cur_global_params)
         elif self.args.aggr == 'median_guard_align2':
             aggregated_updates = self.agg_median_guard_avg_align2(agent_updates_dict, global_model, cur_global_params)
+        elif self.args.aggr == 'median_guard_align3':
+            aggregated_updates = self.agg_median_guard_avg_align3(agent_updates_dict, global_model, cur_global_params)
         elif self.args.aggr == 'trust_clip':
             aggregated_updates = self.agg_trust_clip(agent_updates_dict, global_model, cur_global_params)
         elif self.args.aggr == 'mpsa':
@@ -706,6 +708,32 @@ class Aggregation():
         use_trust_clip = bool(getattr(self.args, "trust_clip_after_mg2", False))
         if use_trust_clip:
             logging.info("[MedianGuard+AvgAlign2] 已开启 trust_clip_after_mg2，对过滤后的客户端执行 trust_clip")
+            aggregated_update = self.agg_trust_clip(selected_updates, global_model, flat_global_model)
+        else:
+            aggregated_update = self.agg_avg(selected_updates)
+
+        return aggregated_update
+
+    def agg_median_guard_avg_align3(self, agent_updates_dict, global_model, flat_global_model):
+        """
+        组合防御：先运行 MedianGuard 过滤客户端，再对保留下来的客户端执行 avg_align。
+        """
+        selected_updates, fallback = self._median_guard_select(agent_updates_dict, flat_global_model)
+        if fallback is not None:
+            return fallback
+        if len(selected_updates) == 0:
+            return torch.zeros_like(flat_global_model)
+        # 在过滤后的客户端集合上运行 avg_align（内部已包含加权聚合逻辑）
+        use_align = bool(getattr(self.args, "avg_align3_use_align", True))
+        use_cosine = bool(getattr(self.args, "avg_align3_use_cosine", True))
+        selected_updates = self.agg_avg_alignment3(
+            selected_updates,
+            use_align=use_align,
+            use_cosine=use_cosine,
+        )
+        use_trust_clip = bool(getattr(self.args, "trust_clip_after_mg2", False))
+        if use_trust_clip:
+            logging.info("[MedianGuard+AvgAlign3] 已开启 trust_clip_after_mg2，对过滤后的客户端执行 trust_clip")
             aggregated_update = self.agg_trust_clip(selected_updates, global_model, flat_global_model)
         else:
             aggregated_update = self.agg_avg(selected_updates)
