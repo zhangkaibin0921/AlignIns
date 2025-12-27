@@ -106,7 +106,7 @@ if __name__ == "__main__":
         "--attack",
         type=str,
         default="badnet",
-        choices=["badnet", "DBA", "neurotoxin", "pgd"],
+        choices=["badnet", "DBA", "neurotoxin", "pgd", "soda"],
     )
     parser.add_argument(
         "--aggr",
