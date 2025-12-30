@@ -148,7 +148,7 @@ class Aggregation():
         aggregated_model = gw.to(self.args.device)
         return aggregated_model
 
-    def agg_alignins(self, agent_updates_dict, flat_global_model):
+    def agg_alignins(self, agent_updates_dict, global_model, flat_global_model):
         local_updates = []
         benign_id = []
         malicious_id = []
