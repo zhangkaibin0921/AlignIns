@@ -148,10 +148,10 @@ class Aggregation():
         aggregated_model = gw.to(self.args.device)
         return aggregated_model
 
-    def agg_alignins(self, agent_updates_dict, global_model, flat_global_model):
+    def agg_alignins(self, agent_updates_dict, flat_global_model):
         local_updates = []
-        benign_id = []  # 实际干净的客户端ID（真实标签）
-        malicious_id = []  # 实际恶意的客户端ID（真实标签）
+        benign_id = []
+        malicious_id = []
 
         for _id, update in agent_updates_dict.items():
             local_updates.append(update)
@@ -160,165 +160,68 @@ class Aggregation():
             else:
                 benign_id.append(_id)
 
-        chosen_clients = malicious_id + benign_id  # 所有客户端ID列表（恶意+干净）
-        num_chosen_clients = len(chosen_clients)
+        chosen_clients = malicious_id + benign_id
+        num_chosen_clients = len(malicious_id + benign_id)
         inter_model_updates = torch.stack(local_updates, dim=0)
 
-        # 获取模型层结构信息（用于归一化和统计）
-        state_dict = global_model.state_dict()
-        layer_ranges = []
-        start = 0
-        for name, param in state_dict.items():
-            length = param.numel()
-            layer_ranges.append((name, start, start + length))
-            start += length
-        layer_starts = [s for (_, s, _) in layer_ranges]
-
-        # 分层归一化（Layer-wise normalization）
-        use_layer_norm = getattr(self.args, "alignins_layer_norm", False)
-        if use_layer_norm:
-            # 对每个客户端的更新进行分层归一化
-            normalized_updates = []
-            eps = 1e-8
-            for update in local_updates:
-                normalized_update = torch.zeros_like(update)
-                for name, start_idx, end_idx in layer_ranges:
-                    layer_grad = update[start_idx:end_idx]
-                    layer_norm = torch.norm(layer_grad)
-                    if layer_norm > eps:
-                        normalized_update[start_idx:end_idx] = layer_grad / layer_norm
-                    else:
-                        normalized_update[start_idx:end_idx] = layer_grad
-                normalized_updates.append(normalized_update)
-            inter_model_updates = torch.stack(normalized_updates, dim=0)
-            logging.info("[AlignIns] 已应用分层归一化（Layer-wise normalization）")
-
-        # 如果启用了分层归一化，也对全局模型进行归一化（用于 TDA 计算）
-        normalized_flat_global_model = flat_global_model
-        if use_layer_norm:
-            normalized_flat_global_model = torch.zeros_like(flat_global_model)
-            eps = 1e-8
-            for name, start_idx, end_idx in layer_ranges:
-                layer_grad = flat_global_model[start_idx:end_idx]
-                layer_norm = torch.norm(layer_grad)
-                if layer_norm > eps:
-                    normalized_flat_global_model[start_idx:end_idx] = layer_grad / layer_norm
-                else:
-                    normalized_flat_global_model[start_idx:end_idx] = layer_grad
-
-        # 仅在 VGG9（当前用于 CIFAR-10）下统计 Top-k 梯度在各层的占比
-        is_vgg9 = getattr(self.args, "data", "") == "cifar10"
-        layer_hit_counts = None
-        if is_vgg9:
-            layer_hit_counts = {}
-            for name, _, _ in layer_ranges:
-                layer_hit_counts[name] = 0
+        # 确定TDA的参考向量（锚点）
+        use_median_anchor = getattr(self.args, "tda_use_median_anchor", False)
+        
+        if use_median_anchor:
+            # 使用所有客户端的中位数作为锚点
+            tda_anchor = torch.median(inter_model_updates, dim=0).values
+            logging.info("[AlignIns] 使用所有客户端中位数作为TDA锚点")
+        else:
+            # 使用上一轮的global model作为锚点（默认）
+            tda_anchor = flat_global_model
+            logging.info("[AlignIns] 使用上一轮global model作为TDA锚点")
 
         tda_list = []
         mpsa_list = []
-        # 计算主符号（基于归一化后的更新，如果启用了归一化）
         major_sign = torch.sign(torch.sum(torch.sign(inter_model_updates), dim=0))
         cos = torch.nn.CosineSimilarity(dim=0, eps=1e-6)
-        total_topk = 0
         for i in range(len(inter_model_updates)):
-            # Top-k 选择（基于归一化后的更新，如果启用了归一化）
-            _, init_indices = torch.topk(
-                torch.abs(inter_model_updates[i]),
-                int(len(inter_model_updates[i]) * self.args.sparsity)
-            )
-            if is_vgg9 and layer_ranges is not None and len(init_indices) > 0:
-                idx_np = init_indices.detach().cpu().numpy().astype(int)
-                total_topk += idx_np.size
-                for flat_idx in idx_np:
-                    # 使用二分查找定位所属参数张量
-                    layer_idx = bisect.bisect_right(layer_starts, flat_idx) - 1
-                    if 0 <= layer_idx < len(layer_ranges):
-                        layer_name = layer_ranges[layer_idx][0]
-                        layer_hit_counts[layer_name] += 1
-            # 计算MPSA（使用归一化后的更新，如果启用了归一化）
-            mpsa = (torch.sum(
+            _, init_indices = torch.topk(torch.abs(inter_model_updates[i]),
+                                         int(len(inter_model_updates[i]) * self.args.sparsity))
+
+            mpsa_list.append((torch.sum(
                 torch.sign(inter_model_updates[i][init_indices]) == major_sign[init_indices]) / torch.numel(
-                inter_model_updates[i][init_indices])).item()
-            mpsa_list.append(mpsa)
-            # 计算TDA（使用归一化后的值）
-            tda = cos(inter_model_updates[i], normalized_flat_global_model).item()
-            tda_list.append(tda)
+                inter_model_updates[i][init_indices])).item())
+
+            tda_list.append(cos(inter_model_updates[i], tda_anchor).item())
 
         logging.info('TDA: %s' % [round(i, 4) for i in tda_list])
         logging.info('MPSA: %s' % [round(i, 4) for i in mpsa_list])
 
-        # 打印 Top-k 梯度在各层的占比（仅 VGG9）
-        if is_vgg9 and layer_hit_counts is not None and total_topk > 0:
-            layer_ratios = {
-                name: count / total_topk for name, count in layer_hit_counts.items() if count > 0
-            }
-            # 按占比从大到小排序，便于观察主要来源层
-            sorted_items = sorted(layer_ratios.items(), key=lambda x: x[1], reverse=True)
-            pretty_ratios = {name: round(ratio, 4) for name, ratio in sorted_items}
-            logging.info(f"[AlignIns][VGG9] Top-{int(self.args.sparsity * 100)}%% 梯度在各层的占比: {pretty_ratios}")
-
         ######## MZ-score calculation ########
-        # MPSA的MZ-score
-        mpsa_std = np.std(mpsa_list) if len(mpsa_list) > 1 else 1e-12
+        mpsa_std = np.std(mpsa_list)
         mpsa_med = np.median(mpsa_list)
-        mzscore_mpsa = [np.abs(m - mpsa_med) / mpsa_std for m in mpsa_list]
+
+        mzscore_mpsa = []
+        for i in range(len(mpsa_list)):
+            mzscore_mpsa.append(np.abs(mpsa_list[i] - mpsa_med) / mpsa_std)
+
         logging.info('MZ-score of MPSA: %s' % [round(i, 4) for i in mzscore_mpsa])
 
-        # TDA的MZ-score
-        tda_std = np.std(tda_list) if len(tda_list) > 1 else 1e-12
+        tda_std = np.std(tda_list)
         tda_med = np.median(tda_list)
-        mzscore_tda = [np.abs(t - tda_med) / tda_std for t in tda_list]
+        mzscore_tda = []
+        for i in range(len(tda_list)):
+            mzscore_tda.append(np.abs(tda_list[i] - tda_med) / tda_std)
+
         logging.info('MZ-score of TDA: %s' % [round(i, 4) for i in mzscore_tda])
 
         ######## Anomaly detection with MZ score ########
-        # MPSA筛选出的良性索引（chosen_clients的索引）
-        benign_idx1 = set(range(num_chosen_clients))
-        benign_idx1.intersection_update(
-            set(np.argwhere(np.array(mzscore_mpsa) < self.args.lambda_s).flatten().astype(int)))
 
-        # TDA筛选出的良性索引（chosen_clients的索引）
-        benign_idx2 = set(range(num_chosen_clients))
-        benign_idx2.intersection_update(
-            set(np.argwhere(np.array(mzscore_tda) < self.args.lambda_c).flatten().astype(int)))
+        benign_idx1 = set([i for i in range(num_chosen_clients)])
+        benign_idx1 = benign_idx1.intersection(
+            set([int(i) for i in np.argwhere(np.array(mzscore_mpsa) < self.args.lambda_s)]))
+        benign_idx2 = set([i for i in range(num_chosen_clients)])
+        benign_idx2 = benign_idx2.intersection(
+            set([int(i) for i in np.argwhere(np.array(mzscore_tda) < self.args.lambda_c)]))
 
-        ######## 计算MPSA和TDA的Precision并打印 ########
-        def _calc_precision(selected_indices, chosen_ids, actual_benign_ids):
-            """
-            计算Precision：真正干净数 / 选中数
-            selected_indices：筛选出的索引（对应chosen_ids的索引）
-            chosen_ids：所有客户端ID列表（malicious_id + benign_id）
-            actual_benign_ids：实际干净的客户端ID列表（真实标签）
-            """
-            selected_count = len(selected_indices)
-            if selected_count == 0:
-                return None, selected_count, 0
-            # 统计选中的客户端中实际干净的数量
-            true_clean_count = 0
-            for idx in selected_indices:
-                actual_id = chosen_ids[idx]  # 索引对应的实际客户端ID
-                if actual_id in actual_benign_ids:
-                    true_clean_count += 1
-            precision = true_clean_count / selected_count
-            return precision, selected_count, true_clean_count
-
-        # MPSA的Precision
-        mpsa_precision, mpsa_selected, mpsa_true_clean = _calc_precision(benign_idx1, chosen_clients, benign_id)
-        if mpsa_precision is not None:
-            logging.info(
-                f"[MPSA] 识别的干净客户端准确率(Precision): {mpsa_precision:.4f}  |  选中数: {mpsa_selected}  真正干净数: {mpsa_true_clean}")
-        else:
-            logging.info(f"[MPSA] 无选中客户端，无法计算干净客户端准确率")
-
-        # TDA的Precision
-        tda_precision, tda_selected, tda_true_clean = _calc_precision(benign_idx2, chosen_clients, benign_id)
-        if tda_precision is not None:
-            logging.info(
-                f"[TDA] 识别的干净客户端准确率(Precision): {tda_precision:.4f}  |  选中数: {tda_selected}  真正干净数: {tda_true_clean}")
-        else:
-            logging.info(f"[TDA] 无选中客户端，无法计算干净客户端准确率")
-
-        ######## 后续原有逻辑 ########
         benign_set = benign_idx2.intersection(benign_idx1)
+
         benign_idx = list(benign_set)
         if len(benign_idx) == 0:
             return torch.zeros_like(local_updates[0])
@@ -326,36 +229,253 @@ class Aggregation():
         benign_updates = torch.stack([local_updates[i] for i in benign_idx], dim=0)
 
         ######## Post-filtering model clipping ########
+
         updates_norm = torch.norm(benign_updates, dim=1).reshape((-1, 1))
         norm_clip = updates_norm.median(dim=0)[0].item()
         benign_updates = torch.stack(local_updates, dim=0)
         updates_norm = torch.norm(benign_updates, dim=1).reshape((-1, 1))
         updates_norm_clipped = torch.clamp(updates_norm, 0, norm_clip, out=None)
+        # del grad_norm
+
         benign_updates = (benign_updates / updates_norm) * updates_norm_clipped
 
-        ######## 原有TPR/FPR计算 ########
         correct = 0
         for idx in benign_idx:
-            if chosen_clients[idx] in benign_id:  # 修正：用实际ID判断是否干净
+            if idx >= len(malicious_id):
                 correct += 1
-        TPR = correct / len(benign_id) if len(benign_id) > 0 else 0.0
 
-        FPR = 0.0
-        if len(malicious_id) > 0:
+        TPR = correct / len(benign_id)
+
+        if len(malicious_id) == 0:
+            FPR = 0
+        else:
             wrong = 0
             for idx in benign_idx:
-                if chosen_clients[idx] in malicious_id:  # 修正：用实际ID判断是否恶意
+                if idx < len(malicious_id):
                     wrong += 1
             FPR = wrong / len(malicious_id)
 
         logging.info('benign update index:   %s' % str(benign_id))
         logging.info('selected update index: %s' % str(benign_idx))
+
         logging.info('FPR:       %.4f' % FPR)
         logging.info('TPR:       %.4f' % TPR)
 
-        current_dict = {chosen_clients[idx]: benign_updates[idx] for idx in benign_idx}
+        current_dict = {}
+        for idx in benign_idx:
+            current_dict[chosen_clients[idx]] = benign_updates[idx]
+
         aggregated_update = self.agg_avg(current_dict)
         return aggregated_update
+
+    # def agg_alignins(self, agent_updates_dict, global_model, flat_global_model):
+    #     local_updates = []
+    #     benign_id = []  # 实际干净的客户端ID（真实标签）
+    #     malicious_id = []  # 实际恶意的客户端ID（真实标签）
+    #
+    #     for _id, update in agent_updates_dict.items():
+    #         local_updates.append(update)
+    #         if _id < self.args.num_corrupt:
+    #             malicious_id.append(_id)
+    #         else:
+    #             benign_id.append(_id)
+    #
+    #     chosen_clients = malicious_id + benign_id  # 所有客户端ID列表（恶意+干净）
+    #     num_chosen_clients = len(chosen_clients)
+    #     inter_model_updates = torch.stack(local_updates, dim=0)
+    #
+    #     # 获取模型层结构信息（用于归一化和统计）
+    #     state_dict = global_model.state_dict()
+    #     layer_ranges = []
+    #     start = 0
+    #     for name, param in state_dict.items():
+    #         length = param.numel()
+    #         layer_ranges.append((name, start, start + length))
+    #         start += length
+    #     layer_starts = [s for (_, s, _) in layer_ranges]
+    #
+    #     # 分层归一化（Layer-wise normalization）
+    #     use_layer_norm = getattr(self.args, "alignins_layer_norm", False)
+    #     if use_layer_norm:
+    #         # 对每个客户端的更新进行分层归一化
+    #         normalized_updates = []
+    #         eps = 1e-8
+    #         for update in local_updates:
+    #             normalized_update = torch.zeros_like(update)
+    #             for name, start_idx, end_idx in layer_ranges:
+    #                 layer_grad = update[start_idx:end_idx]
+    #                 layer_norm = torch.norm(layer_grad)
+    #                 if layer_norm > eps:
+    #                     normalized_update[start_idx:end_idx] = layer_grad / layer_norm
+    #                 else:
+    #                     normalized_update[start_idx:end_idx] = layer_grad
+    #             normalized_updates.append(normalized_update)
+    #         inter_model_updates = torch.stack(normalized_updates, dim=0)
+    #         logging.info("[AlignIns] 已应用分层归一化（Layer-wise normalization）")
+    #
+    #     # 如果启用了分层归一化，也对全局模型进行归一化（用于 TDA 计算）
+    #     normalized_flat_global_model = flat_global_model
+    #     if use_layer_norm:
+    #         normalized_flat_global_model = torch.zeros_like(flat_global_model)
+    #         eps = 1e-8
+    #         for name, start_idx, end_idx in layer_ranges:
+    #             layer_grad = flat_global_model[start_idx:end_idx]
+    #             layer_norm = torch.norm(layer_grad)
+    #             if layer_norm > eps:
+    #                 normalized_flat_global_model[start_idx:end_idx] = layer_grad / layer_norm
+    #             else:
+    #                 normalized_flat_global_model[start_idx:end_idx] = layer_grad
+    #
+    #     # 仅在 VGG9（当前用于 CIFAR-10）下统计 Top-k 梯度在各层的占比
+    #     is_vgg9 = getattr(self.args, "data", "") == "cifar10"
+    #     layer_hit_counts = None
+    #     if is_vgg9:
+    #         layer_hit_counts = {}
+    #         for name, _, _ in layer_ranges:
+    #             layer_hit_counts[name] = 0
+    #
+    #     tda_list = []
+    #     mpsa_list = []
+    #     # 计算主符号（基于归一化后的更新，如果启用了归一化）
+    #     major_sign = torch.sign(torch.sum(torch.sign(inter_model_updates), dim=0))
+    #     cos = torch.nn.CosineSimilarity(dim=0, eps=1e-6)
+    #     total_topk = 0
+    #     for i in range(len(inter_model_updates)):
+    #         # Top-k 选择（基于归一化后的更新，如果启用了归一化）
+    #         _, init_indices = torch.topk(
+    #             torch.abs(inter_model_updates[i]),
+    #             int(len(inter_model_updates[i]) * self.args.sparsity)
+    #         )
+    #         if is_vgg9 and layer_ranges is not None and len(init_indices) > 0:
+    #             idx_np = init_indices.detach().cpu().numpy().astype(int)
+    #             total_topk += idx_np.size
+    #             for flat_idx in idx_np:
+    #                 # 使用二分查找定位所属参数张量
+    #                 layer_idx = bisect.bisect_right(layer_starts, flat_idx) - 1
+    #                 if 0 <= layer_idx < len(layer_ranges):
+    #                     layer_name = layer_ranges[layer_idx][0]
+    #                     layer_hit_counts[layer_name] += 1
+    #         # 计算MPSA（使用归一化后的更新，如果启用了归一化）
+    #         mpsa = (torch.sum(
+    #             torch.sign(inter_model_updates[i][init_indices]) == major_sign[init_indices]) / torch.numel(
+    #             inter_model_updates[i][init_indices])).item()
+    #         mpsa_list.append(mpsa)
+    #         # 计算TDA（使用归一化后的值）
+    #         tda = cos(inter_model_updates[i], normalized_flat_global_model).item()
+    #         tda_list.append(tda)
+    #
+    #     logging.info('TDA: %s' % [round(i, 4) for i in tda_list])
+    #     logging.info('MPSA: %s' % [round(i, 4) for i in mpsa_list])
+    #
+    #     # 打印 Top-k 梯度在各层的占比（仅 VGG9）
+    #     if is_vgg9 and layer_hit_counts is not None and total_topk > 0:
+    #         layer_ratios = {
+    #             name: count / total_topk for name, count in layer_hit_counts.items() if count > 0
+    #         }
+    #         # 按占比从大到小排序，便于观察主要来源层
+    #         sorted_items = sorted(layer_ratios.items(), key=lambda x: x[1], reverse=True)
+    #         pretty_ratios = {name: round(ratio, 4) for name, ratio in sorted_items}
+    #         logging.info(f"[AlignIns][VGG9] Top-{int(self.args.sparsity * 100)}%% 梯度在各层的占比: {pretty_ratios}")
+    #
+    #     ######## MZ-score calculation ########
+    #     # MPSA的MZ-score
+    #     mpsa_std = np.std(mpsa_list) if len(mpsa_list) > 1 else 1e-12
+    #     mpsa_med = np.median(mpsa_list)
+    #     mzscore_mpsa = [np.abs(m - mpsa_med) / mpsa_std for m in mpsa_list]
+    #     logging.info('MZ-score of MPSA: %s' % [round(i, 4) for i in mzscore_mpsa])
+    #
+    #     # TDA的MZ-score
+    #     tda_std = np.std(tda_list) if len(tda_list) > 1 else 1e-12
+    #     tda_med = np.median(tda_list)
+    #     mzscore_tda = [np.abs(t - tda_med) / tda_std for t in tda_list]
+    #     logging.info('MZ-score of TDA: %s' % [round(i, 4) for i in mzscore_tda])
+    #
+    #     ######## Anomaly detection with MZ score ########
+    #     # MPSA筛选出的良性索引（chosen_clients的索引）
+    #     benign_idx1 = set(range(num_chosen_clients))
+    #     benign_idx1.intersection_update(
+    #         set(np.argwhere(np.array(mzscore_mpsa) < self.args.lambda_s).flatten().astype(int)))
+    #
+    #     # TDA筛选出的良性索引（chosen_clients的索引）
+    #     benign_idx2 = set(range(num_chosen_clients))
+    #     benign_idx2.intersection_update(
+    #         set(np.argwhere(np.array(mzscore_tda) < self.args.lambda_c).flatten().astype(int)))
+    #
+    #     ######## 计算MPSA和TDA的Precision并打印 ########
+    #     def _calc_precision(selected_indices, chosen_ids, actual_benign_ids):
+    #         """
+    #         计算Precision：真正干净数 / 选中数
+    #         selected_indices：筛选出的索引（对应chosen_ids的索引）
+    #         chosen_ids：所有客户端ID列表（malicious_id + benign_id）
+    #         actual_benign_ids：实际干净的客户端ID列表（真实标签）
+    #         """
+    #         selected_count = len(selected_indices)
+    #         if selected_count == 0:
+    #             return None, selected_count, 0
+    #         # 统计选中的客户端中实际干净的数量
+    #         true_clean_count = 0
+    #         for idx in selected_indices:
+    #             actual_id = chosen_ids[idx]  # 索引对应的实际客户端ID
+    #             if actual_id in actual_benign_ids:
+    #                 true_clean_count += 1
+    #         precision = true_clean_count / selected_count
+    #         return precision, selected_count, true_clean_count
+    #
+    #     # MPSA的Precision
+    #     mpsa_precision, mpsa_selected, mpsa_true_clean = _calc_precision(benign_idx1, chosen_clients, benign_id)
+    #     if mpsa_precision is not None:
+    #         logging.info(
+    #             f"[MPSA] 识别的干净客户端准确率(Precision): {mpsa_precision:.4f}  |  选中数: {mpsa_selected}  真正干净数: {mpsa_true_clean}")
+    #     else:
+    #         logging.info(f"[MPSA] 无选中客户端，无法计算干净客户端准确率")
+    #
+    #     # TDA的Precision
+    #     tda_precision, tda_selected, tda_true_clean = _calc_precision(benign_idx2, chosen_clients, benign_id)
+    #     if tda_precision is not None:
+    #         logging.info(
+    #             f"[TDA] 识别的干净客户端准确率(Precision): {tda_precision:.4f}  |  选中数: {tda_selected}  真正干净数: {tda_true_clean}")
+    #     else:
+    #         logging.info(f"[TDA] 无选中客户端，无法计算干净客户端准确率")
+    #
+    #     ######## 后续原有逻辑 ########
+    #     benign_set = benign_idx2.intersection(benign_idx1)
+    #     benign_idx = list(benign_set)
+    #     if len(benign_idx) == 0:
+    #         return torch.zeros_like(local_updates[0])
+    #
+    #     benign_updates = torch.stack([local_updates[i] for i in benign_idx], dim=0)
+    #
+    #     ######## Post-filtering model clipping ########
+    #     updates_norm = torch.norm(benign_updates, dim=1).reshape((-1, 1))
+    #     norm_clip = updates_norm.median(dim=0)[0].item()
+    #     benign_updates = torch.stack(local_updates, dim=0)
+    #     updates_norm = torch.norm(benign_updates, dim=1).reshape((-1, 1))
+    #     updates_norm_clipped = torch.clamp(updates_norm, 0, norm_clip, out=None)
+    #     benign_updates = (benign_updates / updates_norm) * updates_norm_clipped
+    #
+    #     ######## 原有TPR/FPR计算 ########
+    #     correct = 0
+    #     for idx in benign_idx:
+    #         if chosen_clients[idx] in benign_id:  # 修正：用实际ID判断是否干净
+    #             correct += 1
+    #     TPR = correct / len(benign_id) if len(benign_id) > 0 else 0.0
+    #
+    #     FPR = 0.0
+    #     if len(malicious_id) > 0:
+    #         wrong = 0
+    #         for idx in benign_idx:
+    #             if chosen_clients[idx] in malicious_id:  # 修正：用实际ID判断是否恶意
+    #                 wrong += 1
+    #         FPR = wrong / len(malicious_id)
+    #
+    #     logging.info('benign update index:   %s' % str(benign_id))
+    #     logging.info('selected update index: %s' % str(benign_idx))
+    #     logging.info('FPR:       %.4f' % FPR)
+    #     logging.info('TPR:       %.4f' % TPR)
+    #
+    #     current_dict = {chosen_clients[idx]: benign_updates[idx] for idx in benign_idx}
+    #     aggregated_update = self.agg_avg(current_dict)
+    #     return aggregated_update
 
     def agg_tda_only(self, agent_updates_dict, global_model, flat_global_model):
         """
