@@ -134,6 +134,34 @@ class Agent():
                     cos_loss = torch.nn.functional.cosine_similarity(current_params, fixed_params, dim=0)
                     minibatch_loss = minibatch_loss + 0.1 * l2_loss + 100 * (1 - cos_loss)
                 
+                # Adaptive attack: constrain cosine similarity and sign alignment with previous global model
+                if self.is_malicious and self.args.attack == 'adaptive' and initial_global_model_params is not None:
+                    current_params = self.get_model_parameters(global_model)
+                    
+                    # Calculate current update vector (difference from previous global model)
+                    current_update = current_params - initial_global_model_params
+                    
+                    # 1. Cosine similarity loss (TDA constraint)
+                    # Maximize cosine similarity between update and previous global model
+                    cos_sim = torch.nn.functional.cosine_similarity(
+                        current_update, 
+                        initial_global_model_params, 
+                        dim=0
+                    )
+                    cos_loss = 1 - cos_sim  # Minimize this to maximize cosine similarity
+                    
+                    # 2. Sign alignment loss (MPSA constraint)
+                    # Maximize sign alignment between update and previous global model (all coordinates)
+                    reference_sign = torch.sign(initial_global_model_params)
+                    update_sign = torch.sign(current_update)
+                    
+                    # Calculate sign alignment proportion for all coordinates
+                    sign_alignment = torch.sum(update_sign == reference_sign).float() / len(current_update)
+                    sign_loss = 1 - sign_alignment  # Minimize this to maximize sign alignment
+                    
+                    # Add regularization terms to loss
+                    minibatch_loss = minibatch_loss + 100.0 * cos_loss + 100.0 * sign_loss
+                
                 minibatch_loss.backward()
                 if self.args.attack == "neurotoxin" and len(neurotoxin_mask) and self.id < self.args.num_corrupt:
                     for name, param in global_model.named_parameters():
