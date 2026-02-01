@@ -135,45 +135,48 @@ class Agent():
                     minibatch_loss = minibatch_loss + 0.1 * l2_loss + 100 * (1 - cos_loss)
                 
                 # Adaptive attack: constrain cosine similarity and sign alignment with previous global model
+                # Only apply constraint in the last epoch to avoid over-constraining during training
                 if self.is_malicious and self.args.attack == 'adaptive' and initial_global_model_params is not None:
                     current_params = self.get_model_parameters(global_model)
                     
-                    # Calculate current update vector (difference from previous global model)
-                    current_update = current_params - initial_global_model_params
-                    
                     # 1. Cosine similarity loss (TDA constraint)
-                    # Maximize cosine similarity between update and previous global model
+                    # Maximize cosine similarity between current params and previous global model
                     # Add numerical stability check
-                    update_norm = torch.norm(current_update)
+                    current_norm = torch.norm(current_params)
                     ref_norm = torch.norm(initial_global_model_params)
                     eps = 1e-8
                     
-                    if update_norm > eps and ref_norm > eps:
+                    if current_norm > eps and ref_norm > eps:
                         # Use same cosine similarity calculation as defense mechanism
                         cos = torch.nn.CosineSimilarity(dim=0, eps=1e-6)
-                        cos_sim = cos(current_update, initial_global_model_params)
+                        cos_sim = cos(current_params, initial_global_model_params)
                         # Clamp cos_sim to [-1, 1] for numerical stability
                         cos_sim = torch.clamp(cos_sim, -1.0, 1.0)
                         cos_loss = 1 - cos_sim  # Range: [0, 2]
                     else:
-                        cos_loss = torch.tensor(0.0, device=current_update.device)
+                        cos_loss = torch.tensor(0.0, device=current_params.device)
                     
                     # 2. Sign alignment loss (MPSA constraint)
-                    # Maximize sign alignment between update and previous global model (all coordinates)
+                    # Maximize sign alignment between current params and previous global model (all coordinates)
                     reference_sign = torch.sign(initial_global_model_params)
-                    update_sign = torch.sign(current_update)
+                    current_sign = torch.sign(current_params)
                     
                     # Calculate sign alignment proportion for all coordinates
-                    sign_alignment = torch.sum(update_sign == reference_sign).float() / len(current_update)
+                    sign_alignment = torch.sum(current_sign == reference_sign).float() / len(current_params)
                     sign_loss = 1 - sign_alignment  # Range: [0, 1]
                     
-                    # Print loss values for debugging
-                    original_loss = minibatch_loss.item() if isinstance(minibatch_loss, torch.Tensor) else minibatch_loss
-                    cos_loss_val = cos_loss.item() if isinstance(cos_loss, torch.Tensor) else cos_loss
-                    sign_loss_val = sign_loss.item() if isinstance(sign_loss, torch.Tensor) else sign_loss
-                    print(f"[Adaptive Attack] Client {self.id} - Original Loss: {original_loss:.6f}, Cos Loss: {cos_loss_val:.6f}, Sign Loss: {sign_loss_val:.6f}")
+                    # Use smaller weights to avoid over-constraining and preserve attack effectiveness
+                    # Gradually increase weight as training progresses
+                    cos_weight = 1.0  # Reduced from 10.0
+                    sign_weight = 1.0  # Reduced from 10.0
                     
-                    minibatch_loss = minibatch_loss + 10.0 * cos_loss + 10.0 * sign_loss
+                    # Print loss values for debugging
+                    # original_loss = minibatch_loss.item() if isinstance(minibatch_loss, torch.Tensor) else minibatch_loss
+                    # cos_loss_val = cos_loss.item() if isinstance(cos_loss, torch.Tensor) else cos_loss
+                    # sign_loss_val = sign_loss.item() if isinstance(sign_loss, torch.Tensor) else sign_loss
+                    # print(f"[Adaptive Attack] Client {self.id} - Original Loss: {original_loss:.6f}, Cos Loss: {cos_loss_val:.6f}, Sign Loss: {sign_loss_val:.6f}")
+                    
+                    minibatch_loss = minibatch_loss + cos_weight * cos_loss + sign_weight * sign_loss
                 
                 minibatch_loss.backward()
                 if self.args.attack == "neurotoxin" and len(neurotoxin_mask) and self.id < self.args.num_corrupt:
