@@ -143,12 +143,22 @@ class Agent():
                     
                     # 1. Cosine similarity loss (TDA constraint)
                     # Maximize cosine similarity between update and previous global model
-                    cos_sim = torch.nn.functional.cosine_similarity(
-                        current_update, 
-                        initial_global_model_params, 
-                        dim=0
-                    )
-                    cos_loss = 1 - cos_sim  # Minimize this to maximize cosine similarity
+                    # Add numerical stability check
+                    update_norm = torch.norm(current_update)
+                    ref_norm = torch.norm(initial_global_model_params)
+                    eps = 1e-8
+                    
+                    if update_norm > eps and ref_norm > eps:
+                        cos_sim = torch.nn.functional.cosine_similarity(
+                            current_update.unsqueeze(0), 
+                            initial_global_model_params.unsqueeze(0), 
+                            dim=1
+                        ).squeeze()
+                        # Clamp cos_sim to [-1, 1] for numerical stability
+                        cos_sim = torch.clamp(cos_sim, -1.0, 1.0)
+                        cos_loss = 1 - cos_sim  # Range: [0, 2]
+                    else:
+                        cos_loss = torch.tensor(0.0, device=current_update.device)
                     
                     # 2. Sign alignment loss (MPSA constraint)
                     # Maximize sign alignment between update and previous global model (all coordinates)
@@ -157,10 +167,15 @@ class Agent():
                     
                     # Calculate sign alignment proportion for all coordinates
                     sign_alignment = torch.sum(update_sign == reference_sign).float() / len(current_update)
-                    sign_loss = 1 - sign_alignment  # Minimize this to maximize sign alignment
+                    sign_loss = 1 - sign_alignment  # Range: [0, 1]
                     
-                    # Add regularization terms to loss
-                    minibatch_loss = minibatch_loss + 100.0 * cos_loss + 100.0 * sign_loss
+                    # Print loss values for debugging
+                    original_loss = minibatch_loss.item() if isinstance(minibatch_loss, torch.Tensor) else minibatch_loss
+                    cos_loss_val = cos_loss.item() if isinstance(cos_loss, torch.Tensor) else cos_loss
+                    sign_loss_val = sign_loss.item() if isinstance(sign_loss, torch.Tensor) else sign_loss
+                    print(f"[Adaptive Attack] Client {self.id} - Original Loss: {original_loss:.6f}, Cos Loss: {cos_loss_val:.6f}, Sign Loss: {sign_loss_val:.6f}")
+                    
+                    minibatch_loss = minibatch_loss + 10.0 * cos_loss + 10.0 * sign_loss
                 
                 minibatch_loss.backward()
                 if self.args.attack == "neurotoxin" and len(neurotoxin_mask) and self.id < self.args.num_corrupt:
