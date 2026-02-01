@@ -149,11 +149,9 @@ class Agent():
                     eps = 1e-8
                     
                     if update_norm > eps and ref_norm > eps:
-                        cos_sim = torch.nn.functional.cosine_similarity(
-                            current_update.unsqueeze(0), 
-                            initial_global_model_params.unsqueeze(0), 
-                            dim=1
-                        ).squeeze()
+                        # Use same cosine similarity calculation as defense mechanism
+                        cos = torch.nn.CosineSimilarity(dim=0, eps=1e-6)
+                        cos_sim = cos(current_update, initial_global_model_params)
                         # Clamp cos_sim to [-1, 1] for numerical stability
                         cos_sim = torch.clamp(cos_sim, -1.0, 1.0)
                         cos_loss = 1 - cos_sim  # Range: [0, 2]
