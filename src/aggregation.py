@@ -1787,7 +1787,7 @@ class Aggregation():
                     dist = np.sqrt((1.0 - cosine_sim) ** 2 + (1.0 - align_score) ** 2)
                     feature_dist_matrix[i, j] = dist
 
-        logging.info("[AvgAlign2] Feature distance matrix: %s", np.round(feature_dist_matrix, 3).tolist())
+        logging.debug("[AvgAlign2] Feature distance matrix: %s", np.round(feature_dist_matrix, 3).tolist())
 
         cluster_labels = None
         cluster_stats = []
