@@ -1663,8 +1663,8 @@ class Aggregation():
                 f"min={arr.min():.4f}, max={arr.max():.4f}"
             )
 
-        logging.info("[AvgAlign2] Pairwise sign-alignment matrix: %s", np.round(align_matrix, 3).tolist())
-        logging.info("[AvgAlign2] Pairwise cosine similarity matrix: %s", np.round(cosine_matrix, 3).tolist())
+        logging.debug("[AvgAlign2] Pairwise sign-alignment matrix: %s", np.round(align_matrix, 3).tolist())
+        logging.debug("[AvgAlign2] Pairwise cosine similarity matrix: %s", np.round(cosine_matrix, 3).tolist())
         _log_stats("Benign-Benign (Align)", benign_pairs)
         _log_stats("Benign-Malicious (Align)", mixed_pairs)
         _log_stats("Malicious-Malicious (Align)", malicious_pairs)
@@ -1703,8 +1703,8 @@ class Aggregation():
             for j in range(n_clients):
                 feature_matrix_normalized[i, j] = [cosine_matrix_normalized[i, j], align_matrix_normalized[i, j]]
 
-        logging.info("[AvgAlign2] Normalized pairwise sign-alignment matrix: %s", np.round(align_matrix_normalized, 3).tolist())
-        logging.info("[AvgAlign2] Normalized pairwise cosine similarity matrix: %s", np.round(cosine_matrix_normalized, 3).tolist())
+        logging.debug("[AvgAlign2] Normalized pairwise sign-alignment matrix: %s", np.round(align_matrix_normalized, 3).tolist())
+        logging.debug("[AvgAlign2] Normalized pairwise cosine similarity matrix: %s", np.round(cosine_matrix_normalized, 3).tolist())
 
         # 归一化后的分组统计
         benign_pairs_normalized = []
