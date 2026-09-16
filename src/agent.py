@@ -16,6 +16,18 @@ class Agent():
         if self.args.data != "tinyimagenet":
             self.train_dataset = utils.DatasetSplit(train_dataset, data_idxs)
 
+            # Adaptive MDF uses a clean local update as an attacker-side proxy for
+            # the unavailable current-round median update.  Preserve this split
+            # before poisoning rather than using the whole training dataset.
+            adaptive_attacks = {"adaptive", "adaptive_mdf", "adaptive_pdc", "adaptive_joint"}
+            if self.id < args.num_corrupt and self.args.attack in adaptive_attacks:
+                self.adaptive_clean_train_loader = DataLoader(
+                    copy.deepcopy(self.train_dataset), batch_size=self.args.bs,
+                    shuffle=True, num_workers=args.num_workers, pin_memory=False,
+                    drop_last=True,
+                )
+                self._adaptive_reference_cache = {}
+
             # for backdoor attack, agent poisons his local dataset
             if self.id < args.num_corrupt and self.args.attack != 'non' and self.args.data != 'sen140':
                 self.data_idxs = data_idxs
@@ -64,14 +76,132 @@ class Agent():
             self.train_loader = DataLoader(self.train_dataset, batch_size=self.args.bs, shuffle=True, \
                                            num_workers=self.args.num_workers, pin_memory=False, drop_last=True)
 
-    def local_train(self, global_model, criterion, round=None, neurotoxin_mask=None):
+    def _adaptive_weights(self):
+        """返回 (w_cos, w_sign, w_div)，对应三种简单攻击变体：
+        - adaptive / adaptive_mdf : 只规避 MDF（L_cos + L_sign，锚定全局）
+        - adaptive_pdc            : 只规避 PDC（L_div，恶意客户端互相发散）
+        - adaptive_joint          : 同时规避两阶段
+        """
+        attack = self.args.attack
+        lambda_cos = float(getattr(self.args, "lambda_cos", 1.0))
+        lambda_sign = float(getattr(self.args, "lambda_sign", 1.0))
+        lambda_div = float(getattr(self.args, "lambda_div", 1.0))
+        if attack == "adaptive" or attack == "adaptive_mdf":
+            return lambda_cos, lambda_sign, 0.0
+        elif attack == "adaptive_pdc":
+            return 0.0, 0.0, lambda_div
+        elif attack == "adaptive_joint":
+            return lambda_cos, lambda_sign, lambda_div
+        return 0.0, 0.0, 0.0
+
+    def _adaptive_clean_update(self, global_model, criterion, round, initial_trainable_params):
+        """Return a cached clean local update used as the MDF proxy direction."""
+        if not hasattr(self, "adaptive_clean_train_loader"):
+            return None
+        if round in self._adaptive_reference_cache:
+            return self._adaptive_reference_cache[round]
+
+        reference_model = copy.deepcopy(global_model)
+        reference_model.train()
+        optimizer = torch.optim.SGD(
+            reference_model.parameters(),
+            lr=self.args.client_lr * (self.args.lr_decay) ** round,
+            weight_decay=self.args.wd,
+            momentum=self.args.momentum,
+        )
+        for _ in range(self.args.local_ep):
+            for inputs, labels in self.adaptive_clean_train_loader:
+                optimizer.zero_grad()
+                inputs = inputs.to(device=self.args.device, non_blocking=True)
+                labels = labels.to(device=self.args.device, non_blocking=True)
+                criterion(reference_model(inputs), labels).backward()
+                optimizer.step()
+
+        clean_update = (
+            self.get_model_parameters(reference_model).detach() - initial_trainable_params
+        )
+        # Candidate and refinement share only the current round's reference.
+        # Keeping every historical parameter vector would grow GPU memory linearly
+        # with the number of communication rounds.
+        self._adaptive_reference_cache = {round: clean_update}
+        return clean_update
+
+    def _mdf_losses(self, current_update, reference_update):
+        """Differentiable MDF proxies for cosine and sign consistency on updates."""
+        zero = torch.zeros((), device=current_update.device)
+        if reference_update is None:
+            return zero, zero
+        eps = 1e-8
+        cur_norm = torch.norm(current_update)
+        ref_norm = torch.norm(reference_update)
+        if cur_norm <= eps or ref_norm <= eps:
+            return zero, zero
+
+        cos_loss = 1 - torch.clamp(
+            torch.dot(current_update, reference_update) / (cur_norm * ref_norm), -1.0, 1.0
+        )
+        # A hard sign comparison has no gradient. tanh is a smooth sign proxy;
+        # the reference update is detached and therefore only guides this client.
+        reference_sign = torch.sign(reference_update)
+        active = reference_sign.ne(0)
+        if not torch.any(active):
+            return cos_loss, zero
+        scale = reference_update.abs().mean().detach().clamp_min(eps)
+        soft_sign = torch.tanh(current_update / scale)
+        sign_loss = 1 - (soft_sign[active] * reference_sign[active]).mean()
+        return cos_loss, sign_loss
+
+    def _pdc_diversity_loss(self, current_update, peer_updates):
+        """Reduce same-round pairwise update cohesion used by avg_align2/PDC."""
+        zero = torch.zeros((), device=current_update.device)
+        if not peer_updates:
+            return zero
+        eps = 1e-8
+        cur_norm = torch.norm(current_update)
+        if cur_norm <= eps:
+            return zero
+
+        scale = current_update.detach().abs().mean().clamp_min(eps)
+        soft_sign = torch.tanh(current_update / scale)
+        total = zero
+        valid = 0
+        for peer_update in peer_updates:
+            peer_update = peer_update.to(current_update.device)
+            peer_norm = torch.norm(peer_update)
+            if peer_update.numel() != current_update.numel() or peer_norm <= eps:
+                continue
+            cosine = torch.dot(current_update, peer_update) / (cur_norm * peer_norm)
+            peer_sign = torch.sign(peer_update)
+            active = peer_sign.ne(0)
+            sign_agreement_proxy = (
+                (soft_sign[active] * peer_sign[active]).mean() if torch.any(active) else zero
+            )
+            # Minimizing the negative score drives down both pairwise directional
+            # similarity and the smooth proxy of sign agreement.
+            total = total + cosine + sign_agreement_proxy
+            valid += 1
+        return -total / valid if valid else zero
+
+    def local_train(self, global_model, criterion, round=None, neurotoxin_mask=None,
+                    adaptive_peer_updates=None, adaptive_mode="single",
+                    return_trainable_update=False):
         # print(len(self.train_dataset))
         """ Do a local training over the received global model, return the update """
         # start = time.time()
         initial_global_model_params = parameters_to_vector(
             [global_model.state_dict()[name] for name in global_model.state_dict()]).detach()
+        initial_trainable_params = self.get_model_parameters(global_model).detach().clone()
         if self.id < self.args.num_corrupt:
             self.check_poison_timing(round)
+
+        is_adaptive = self.is_malicious and self.args.attack in (
+            "adaptive", "adaptive_mdf", "adaptive_pdc", "adaptive_joint")
+        if is_adaptive:
+            w_cos, w_sign, w_div = self._adaptive_weights()
+            reference_update = (
+                self._adaptive_clean_update(global_model, criterion, round, initial_trainable_params)
+                if w_cos > 0 or w_sign > 0 else None
+            )
         
         # SoDa attack: Self-reference training phase
         if self.is_malicious and self.args.attack == 'soda' and hasattr(self, 'clean_train_loader'):
@@ -134,49 +264,23 @@ class Agent():
                     cos_loss = torch.nn.functional.cosine_similarity(current_params, fixed_params, dim=0)
                     minibatch_loss = minibatch_loss + 0.1 * l2_loss + 100 * (1 - cos_loss)
                 
-                # Adaptive attack: constrain cosine similarity and sign alignment with previous global model
-                # Only apply constraint in the last epoch to avoid over-constraining during training
-                if self.is_malicious and self.args.attack == 'adaptive' and initial_global_model_params is not None:
+                # Adaptive attack against MedianGuard + AvgAlign2: both stages
+                # operate on client updates, not on complete model parameters.
+                if is_adaptive and initial_global_model_params is not None:
                     current_params = self.get_model_parameters(global_model)
-                    
-                    # 1. Cosine similarity loss (TDA constraint)
-                    # Maximize cosine similarity between current params and previous global model
-                    # Add numerical stability check
-                    current_norm = torch.norm(current_params)
-                    ref_norm = torch.norm(initial_global_model_params)
-                    eps = 1e-8
-                    
-                    if current_norm > eps and ref_norm > eps:
-                        # Use same cosine similarity calculation as defense mechanism
-                        cos = torch.nn.CosineSimilarity(dim=0, eps=1e-6)
-                        cos_sim = cos(current_params, initial_global_model_params)
-                        # Clamp cos_sim to [-1, 1] for numerical stability
-                        cos_sim = torch.clamp(cos_sim, -1.0, 1.0)
-                        cos_loss = 1 - cos_sim  # Range: [0, 2]
-                    else:
-                        cos_loss = torch.tensor(0.0, device=current_params.device)
-                    
-                    # 2. Sign alignment loss (MPSA constraint)
-                    # Maximize sign alignment between current params and previous global model (all coordinates)
-                    reference_sign = torch.sign(initial_global_model_params)
-                    current_sign = torch.sign(current_params)
-                    
-                    # Calculate sign alignment proportion for all coordinates
-                    sign_alignment = torch.sum(current_sign == reference_sign).float() / len(current_params)
-                    sign_loss = 1 - sign_alignment  # Range: [0, 1]
-                    
-                    # Use smaller weights to avoid over-constraining and preserve attack effectiveness
-                    # Gradually increase weight as training progresses
-                    cos_weight = 1.0  # Reduced from 10.0
-                    sign_weight = 1.0  # Reduced from 10.0
-                    
-                    # Print loss values for debugging
-                    # original_loss = minibatch_loss.item() if isinstance(minibatch_loss, torch.Tensor) else minibatch_loss
-                    # cos_loss_val = cos_loss.item() if isinstance(cos_loss, torch.Tensor) else cos_loss
-                    # sign_loss_val = sign_loss.item() if isinstance(sign_loss, torch.Tensor) else sign_loss
-                    # print(f"[Adaptive Attack] Client {self.id} - Original Loss: {original_loss:.6f}, Cos Loss: {cos_loss_val:.6f}, Sign Loss: {sign_loss_val:.6f}")
-                    
-                    minibatch_loss = minibatch_loss + cos_weight * cos_loss + sign_weight * sign_loss
+                    current_update = current_params - initial_trainable_params
+                    extra_loss = 0.0
+
+                    if w_cos > 0 or w_sign > 0:
+                        cos_loss, sign_loss = self._mdf_losses(current_update, reference_update)
+                        extra_loss = extra_loss + w_cos * cos_loss + w_sign * sign_loss
+
+                    if w_div > 0 and adaptive_mode == "refine":
+                        extra_loss = extra_loss + w_div * self._pdc_diversity_loss(
+                            current_update, adaptive_peer_updates
+                        )
+
+                    minibatch_loss = minibatch_loss + extra_loss
                 
                 minibatch_loss.backward()
                 if self.args.attack == "neurotoxin" and len(neurotoxin_mask) and self.id < self.args.num_corrupt:
@@ -213,5 +317,6 @@ class Agent():
             after_train = parameters_to_vector(
                 [global_model.state_dict()[name] for name in global_model.state_dict()]).detach()
             self.update = after_train - initial_global_model_params
-
+            if return_trainable_update:
+                return self.get_model_parameters(global_model).detach() - initial_trainable_params
             return self.update

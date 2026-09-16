@@ -106,7 +106,20 @@ if __name__ == "__main__":
         "--attack",
         type=str,
         default="badnet",
-        choices=["badnet", "DBA", "neurotoxin", "pgd", "soda", "adaptive"],
+        choices=["badnet", "DBA", "neurotoxin", "pgd", "soda", "adaptive",
+                 "adaptive_mdf", "adaptive_pdc", "adaptive_joint"],
+    )
+    parser.add_argument(
+        "--lambda_cos", type=float, default=1.0,
+        help="attack-side weight for L_cos (MDF evasion, adaptive_mdf/joint)"
+    )
+    parser.add_argument(
+        "--lambda_sign", type=float, default=1.0,
+        help="attack-side weight for L_sign (MDF evasion, adaptive_mdf/joint)"
+    )
+    parser.add_argument(
+        "--lambda_div", type=float, default=1.0,
+        help="attack-side weight for L_div (PDC evasion, adaptive_pdc/joint)"
     )
     parser.add_argument(
         "--aggr",
@@ -346,6 +359,34 @@ if __name__ == "__main__":
         if args.aggr == "lockdown":
             old_mask = [copy.deepcopy(agent.mask) for agent in agents]
 
+        # PDC/AvgAlign2 scores pairwise *same-round updates*.  First obtain one
+        # candidate update from every selected adaptive attacker, then use those
+        # detached candidates as peers during the upload-producing refinement pass.
+        adaptive_pdc_attacks = {"adaptive_pdc", "adaptive_joint"}
+        pdc_active = (
+            args.aggr == "median_guard_align"
+            and args.align_cluster_method != "none"
+        )
+        if args.attack in adaptive_pdc_attacks and not pdc_active:
+            logging.warning(
+                "adaptive_pdc/adaptive_joint requested, but median_guard_align PDC "
+                "clustering is inactive; skipping the PDC refinement pass."
+            )
+        adaptive_pdc_ids = [
+            agent_id for agent_id in chosen
+            if agents[agent_id].is_malicious and args.attack in adaptive_pdc_attacks
+            and not args.super_power and pdc_active
+        ]
+        adaptive_candidates = {}
+        if args.aggr != "lockdown" and len(adaptive_pdc_ids) > 1:
+            for agent_id in adaptive_pdc_ids:
+                global_model = global_model.to(args.device)
+                adaptive_candidates[agent_id] = agents[agent_id].local_train(
+                    global_model, criterion, rnd, neurotoxin_mask=neurotoxin_mask,
+                    adaptive_mode="candidate", return_trainable_update=True,
+                ).detach()
+                utils.vector_to_model(copy.deepcopy(rnd_global_params), global_model)
+
         for agent_id in chosen:
             if agents[agent_id].is_malicious and args.super_power:
                 continue
@@ -361,8 +402,17 @@ if __name__ == "__main__":
                     updates_dict=updates_dict,
                 )
             else:
+                peer_updates = None
+                adaptive_mode = "single"
+                if agent_id in adaptive_candidates:
+                    peer_updates = [
+                        update for peer_id, update in adaptive_candidates.items()
+                        if peer_id != agent_id
+                    ]
+                    adaptive_mode = "refine"
                 update = agents[agent_id].local_train(
-                    global_model, criterion, rnd, neurotoxin_mask=neurotoxin_mask
+                    global_model, criterion, rnd, neurotoxin_mask=neurotoxin_mask,
+                    adaptive_peer_updates=peer_updates, adaptive_mode=adaptive_mode,
                 )
             agent_updates_dict[agent_id] = update
             utils.vector_to_model(copy.deepcopy(rnd_global_params), global_model)
