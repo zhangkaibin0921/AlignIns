@@ -58,6 +58,26 @@ Here,
 
 For other arguments, you can check the `federated.py` file where the detailed explanation is presented.
 
+### Adaptive attack against `median_guard_align`
+
+Use `adaptive_joint` to adapt to both stages of the composed defense.  The MDF
+term matches each attacker's normal cosine/sign scores against a shared clean
+coordinate-median proxy; the PDC term matches AvgAlign2's pairwise top-k
+intersection statistics to the corresponding clean-client statistics.
+
+```bash
+python federated.py \
+  --attack adaptive_joint \
+  --aggr median_guard_align \
+  --align_cluster_method kmeans \
+  --lambda_cos 1.0 --lambda_sign 1.0 --lambda_div 0.1 \
+  --adaptive_refine_steps 2 --adaptive_refine_tol 1e-3
+```
+
+`adaptive_mdf` targets only MedianGuard, `adaptive_pdc` targets only the
+AvgAlign2/PDC stage (while retaining a clean local anchor), and `adaptive_joint`
+targets both.  PDC refinement is active only when clustering is enabled.
+
 ## Citation
 ```
 @InProceedings{Xu_2025_CVPR,

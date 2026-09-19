@@ -119,7 +119,27 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--lambda_div", type=float, default=1.0,
-        help="attack-side weight for L_div (PDC evasion, adaptive_pdc/joint)"
+        help="weight for defense-aligned clean-pair matching (adaptive_pdc/joint)"
+    )
+    parser.add_argument(
+        "--adaptive_refine_steps", type=int, default=2,
+        help="synchronous PDC refinement steps after the initial attacker updates"
+    )
+    parser.add_argument(
+        "--adaptive_refine_tol", type=float, default=1e-3,
+        help="relative update tolerance for early PDC refinement convergence"
+    )
+    parser.add_argument(
+        "--adaptive_sign_temperature", type=float, default=0.1,
+        help="reference-relative smoothing temperature for adaptive sign scores"
+    )
+    parser.add_argument(
+        "--adaptive_cosine_floor", type=float, default=0.05,
+        help="reference-relative norm floor for stable adaptive cosine gradients"
+    )
+    parser.add_argument(
+        "--adaptive_mdf_margin", type=float, default=0.0,
+        help="margin above clean proxy scores for one-sided MedianGuard evasion"
     )
     parser.add_argument(
         "--aggr",
@@ -359,9 +379,34 @@ if __name__ == "__main__":
         if args.aggr == "lockdown":
             old_mask = [copy.deepcopy(agent.mask) for agent in agents]
 
-        # PDC/AvgAlign2 scores pairwise *same-round updates*.  First obtain one
-        # candidate update from every selected adaptive attacker, then use those
-        # detached candidates as peers during the upload-producing refinement pass.
+        # Build same-round clean updates for all selected adaptive attackers.
+        # Their coordinate median is the best attacker-side proxy available for
+        # MedianGuard's hidden all-client coordinate median.  Individual clean
+        # updates remain separate and are used as PDC heterogeneity targets.
+        all_adaptive_attacks = {
+            "adaptive", "adaptive_mdf", "adaptive_pdc", "adaptive_joint"
+        }
+        adaptive_ids = [
+            agent_id for agent_id in chosen
+            if agents[agent_id].is_malicious
+            and args.attack in all_adaptive_attacks
+            and not args.super_power
+        ]
+        adaptive_references = {}
+        for agent_id in adaptive_ids:
+            adaptive_references[agent_id] = agents[agent_id].prepare_adaptive_reference(
+                global_model, criterion, rnd
+            ).detach()
+        adaptive_mdf_reference = None
+        if adaptive_references:
+            adaptive_mdf_reference = torch.median(
+                torch.stack(list(adaptive_references.values()), dim=0), dim=0
+            ).values.detach()
+
+        # PDC/AvgAlign2 scores pairwise *same-round updates*.  Bootstrap one
+        # candidate per attacker, then synchronously refine all candidates.  A
+        # Jacobi-style update keeps every peer fixed within a refinement step and
+        # ensures that the vectors stored below are the vectors actually uploaded.
         adaptive_pdc_attacks = {"adaptive_pdc", "adaptive_joint"}
         pdc_active = (
             args.aggr == "median_guard_align"
@@ -373,26 +418,67 @@ if __name__ == "__main__":
                 "clustering is inactive; skipping the PDC refinement pass."
             )
         adaptive_pdc_ids = [
-            agent_id for agent_id in chosen
-            if agents[agent_id].is_malicious and args.attack in adaptive_pdc_attacks
-            and not args.super_power and pdc_active
+            agent_id for agent_id in adaptive_ids
+            if args.attack in adaptive_pdc_attacks and pdc_active
         ]
         adaptive_candidates = {}
-        if args.aggr != "lockdown" and len(adaptive_pdc_ids) > 1:
+        if args.aggr != "lockdown" and len(adaptive_pdc_ids) > 0:
             for agent_id in adaptive_pdc_ids:
                 global_model = global_model.to(args.device)
                 adaptive_candidates[agent_id] = agents[agent_id].local_train(
                     global_model, criterion, rnd, neurotoxin_mask=neurotoxin_mask,
-                    adaptive_mode="candidate", return_trainable_update=True,
+                    adaptive_mode="candidate",
+                    adaptive_mdf_reference=adaptive_mdf_reference,
+                    return_state_update=True,
                 ).detach()
                 utils.vector_to_model(copy.deepcopy(rnd_global_params), global_model)
+
+            refine_steps = max(1, int(args.adaptive_refine_steps))
+            refine_tol = max(0.0, float(args.adaptive_refine_tol))
+            for refine_step in range(refine_steps):
+                refined_candidates = {}
+                for agent_id in adaptive_pdc_ids:
+                    peer_ids = [peer_id for peer_id in adaptive_pdc_ids if peer_id != agent_id]
+                    peer_updates = [adaptive_candidates[peer_id] for peer_id in peer_ids]
+                    peer_references = [adaptive_references[peer_id] for peer_id in peer_ids]
+                    global_model = global_model.to(args.device)
+                    refined_candidates[agent_id] = agents[agent_id].local_train(
+                        global_model, criterion, rnd,
+                        neurotoxin_mask=neurotoxin_mask,
+                        adaptive_peer_updates=peer_updates,
+                        adaptive_peer_references=peer_references,
+                        adaptive_mdf_reference=adaptive_mdf_reference,
+                        adaptive_mode="refine",
+                        return_state_update=True,
+                    ).detach()
+                    utils.vector_to_model(copy.deepcopy(rnd_global_params), global_model)
+                relative_changes = []
+                for agent_id in adaptive_pdc_ids:
+                    old = adaptive_candidates[agent_id]
+                    new = refined_candidates[agent_id]
+                    relative_changes.append(
+                        (torch.norm(new - old) / torch.norm(old).clamp_min(1e-12)).item()
+                    )
+                adaptive_candidates = refined_candidates
+                max_relative_change = max(relative_changes, default=0.0)
+                logging.info(
+                    "[Adaptive-PDC] refinement %d/%d, max relative change=%.6f",
+                    refine_step + 1, refine_steps, max_relative_change,
+                )
+                if max_relative_change <= refine_tol:
+                    logging.info("[Adaptive-PDC] refinement converged early")
+                    break
 
         for agent_id in chosen:
             if agents[agent_id].is_malicious and args.super_power:
                 continue
             global_model = global_model.to(args.device)
 
-            if args.aggr == "lockdown":
+            if agent_id in adaptive_candidates:
+                # This is the final synchronously refined vector; retraining here
+                # would invalidate the pairwise objective optimized above.
+                update = adaptive_candidates[agent_id]
+            elif args.aggr == "lockdown":
                 update = agents[agent_id].local_train(
                     global_model,
                     criterion,
@@ -402,17 +488,9 @@ if __name__ == "__main__":
                     updates_dict=updates_dict,
                 )
             else:
-                peer_updates = None
-                adaptive_mode = "single"
-                if agent_id in adaptive_candidates:
-                    peer_updates = [
-                        update for peer_id, update in adaptive_candidates.items()
-                        if peer_id != agent_id
-                    ]
-                    adaptive_mode = "refine"
                 update = agents[agent_id].local_train(
                     global_model, criterion, rnd, neurotoxin_mask=neurotoxin_mask,
-                    adaptive_peer_updates=peer_updates, adaptive_mode=adaptive_mode,
+                    adaptive_mdf_reference=adaptive_mdf_reference,
                 )
             agent_updates_dict[agent_id] = update
             utils.vector_to_model(copy.deepcopy(rnd_global_params), global_model)
