@@ -408,14 +408,21 @@ if __name__ == "__main__":
         # Jacobi-style update keeps every peer fixed within a refinement step and
         # ensures that the vectors stored below are the vectors actually uploaded.
         adaptive_pdc_attacks = {"adaptive_pdc", "adaptive_joint"}
+        # PDC is used both as the second stage of ``median_guard_align`` and by
+        # the standalone alignment defenses. ``avg_align3`` is the configurable
+        # dual-feature PDC entry point used for the cosine/sign ablations, while
+        # ``avg_align`` remains supported for compatibility. Enable adaptive
+        # refinement in all of these cases so that a PDC-only experiment does
+        # not silently degrade to ordinary poisoned local training.
         pdc_active = (
-            args.aggr == "median_guard_align"
+            args.aggr in {"median_guard_align", "avg_align", "avg_align3"}
             and args.align_cluster_method != "none"
         )
         if args.attack in adaptive_pdc_attacks and not pdc_active:
             logging.warning(
-                "adaptive_pdc/adaptive_joint requested, but median_guard_align PDC "
-                "clustering is inactive; skipping the PDC refinement pass."
+                "adaptive_pdc/adaptive_joint requested, but PDC clustering is "
+                "inactive for aggregation '%s'; skipping the PDC refinement pass.",
+                args.aggr,
             )
         adaptive_pdc_ids = [
             agent_id for agent_id in adaptive_ids

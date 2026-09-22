@@ -3135,12 +3135,12 @@ class Aggregation():
             )
 
         if use_align:
-            logging.info("[AvgAlign3] Pairwise sign-alignment matrix: %s", np.round(align_matrix, 3).tolist())
+            logging.debug("[AvgAlign3] Pairwise sign-alignment matrix: %s", np.round(align_matrix, 3).tolist())
             _log_stats("Benign-Benign (Align)", benign_pairs)
             _log_stats("Benign-Malicious (Align)", mixed_pairs)
             _log_stats("Malicious-Malicious (Align)", malicious_pairs)
         if use_cosine:
-            logging.info("[AvgAlign3] Pairwise cosine similarity matrix: %s", np.round(cosine_matrix, 3).tolist())
+            logging.debug("[AvgAlign3] Pairwise cosine similarity matrix: %s", np.round(cosine_matrix, 3).tolist())
             _log_stats("Benign-Benign (Cosine)", benign_cosine_pairs)
             _log_stats("Benign-Malicious (Cosine)", mixed_cosine_pairs)
             _log_stats("Malicious-Malicious (Cosine)", malicious_cosine_pairs)
@@ -3187,12 +3187,12 @@ class Aggregation():
                 feature_matrix_normalized[i, j] = np.array(feats, dtype=np.float64)
 
         if use_align:
-            logging.info(
+            logging.debug(
                 "[AvgAlign3] Normalized pairwise sign-alignment matrix: %s",
                 np.round(align_matrix_normalized, 3).tolist(),
             )
         if use_cosine:
-            logging.info(
+            logging.debug(
                 "[AvgAlign3] Normalized pairwise cosine similarity matrix: %s",
                 np.round(cosine_matrix_normalized, 3).tolist(),
             )
@@ -3277,7 +3277,7 @@ class Aggregation():
                     dist = float(np.sqrt(np.sum((1.0 - feat) ** 2)))
                     feature_dist_matrix[i, j] = dist
 
-        logging.info("[AvgAlign3] Feature distance matrix: %s", np.round(feature_dist_matrix, 3).tolist())
+        logging.debug("[AvgAlign3] Feature distance matrix: %s", np.round(feature_dist_matrix, 3).tolist())
 
         cluster_labels = None
         cluster_stats = []
